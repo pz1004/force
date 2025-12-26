@@ -7,6 +7,7 @@ are used in the benchmark and analysis scripts.
 """
 import numpy as np
 import pandas as pd
+import scipy.stats as stats
 from numpy.typing import NDArray
 from typing import Tuple, Optional
 
@@ -73,6 +74,7 @@ def fetch_sp500_data() -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
         raise ImportError("Please install yfinance: pip install yfinance")
 
     print("Fetching S&P 500 Historical Data via yfinance...")
+    # 12 Representative Tickers 
     tickers = ['XOM', 'GE', 'MSFT', 'JPM', 'PG', 'JNJ', 'INTC', 'PFE', 'T', 'VZ', 'IBM', 'KO']
     data = yf.download(tickers, start="2000-01-01", end="2025-01-01", progress=False)['Close']
     
@@ -86,12 +88,13 @@ def fetch_sp500_data() -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
     market_vol = np.mean(np.abs(X), axis=1)
     quiet_days_mask = market_vol < np.percentile(market_vol, 90)
     X_quiet = X[quiet_days_mask]
-    
+
+    print(f"S&P 500 Data Loaded: {X.shape}")
     return X, np.corrcoef(X_quiet, rowvar=False)
 
 
 def fetch_odds_dataset(
-    dataset_name: str, n_max_samples: int = 10000
+    dataset_name: str, n_max_samples: int = 20000
 ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
     Generates a synthetic dataset modeled after the ODDS benchmark datasets.
@@ -138,23 +141,25 @@ def fetch_odds_dataset(
 
 
 def fetch_genomics_data(
-    n_features_limit: int = 500
+    n_samples_target: int = 5000,
+    n_features_target: int = 20
 ) -> Tuple[Optional[NDArray[np.float64]], Optional[NDArray[np.float64]]]:
     """
     Fetches a genomics dataset from Gemma using the gemmapy library.
 
-    Searches for a 'cancer' dataset, downloads its processed expression data,
-    and selects the most variable features.
+    Searches for tissue-related datasets with sufficient samples, downloads
+    processed expression data, and selects the most variable features.
+    Default targets ~1200 samples × 20 features (GSE6306 brain tissue dataset).
 
     Args:
-        n_features_limit: The maximum number of features to keep.
+        n_samples_target: Target number of samples (will use up to this many).
+        n_features_target: Target number of features (most variable genes).
 
     Returns:
         A tuple containing:
-        - X (NDArray | None): The data matrix, or None if fetching fails.
-        - ref_corr (NDArray | None): A reference correlation matrix (computed
-          with Spearman), or None.
-          
+        - X (NDArray | None): The data matrix of shape (n_samples, n_features).
+        - ref_corr (NDArray | None): A reference correlation matrix (Spearman).
+
     Raises:
         ImportError: If `gemmapy` is not installed.
     """
@@ -163,29 +168,80 @@ def fetch_genomics_data(
     except ImportError:
         raise ImportError("Please install gemmapy: pip install gemmapy")
 
-    print("Fetching Genomics data via gemmapy...")
+    print(f"Fetching Genomics data (target: {n_samples_target} samples, {n_features_target} features)...")
+    api = gemmapy.GemmaPy()
+
+    # Search for datasets with sufficient samples - 'tissue' query has largest datasets
+    datasets = api.get_datasets(query='tissue', limit=100)
+
+    if datasets.empty:
+        print("No datasets found for query 'tissue'")
+        return None, None
+
+    # Sort by sample count descending to find datasets with most samples
+    datasets = datasets.sort_values('experiment_sample_count', ascending=False)
+
+    # Find a dataset with enough samples (at least 500 for stable correlation)
+    target_dataset = None
+    for _, ds in datasets.iterrows():
+        sample_count = ds.get('experiment_sample_count', 0)
+        if sample_count >= 500:
+            target_dataset = ds
+            break
+
+    if target_dataset is None:
+        # Fallback to largest available
+        print("No dataset with 500+ samples found, using largest available.")
+        target_dataset = datasets.iloc[0]
+
+    exp_name = target_dataset['experiment_short_name']
+    exp_id = target_dataset['experiment_ID']
+    exp_samples = target_dataset['experiment_sample_count']
+    print(f"Selected: {exp_name} (ID: {exp_id}, samples: {exp_samples})")
+
     try:
-        api = gemmapy.GemmaPy()
-        datasets = api.get_datasets(query='cancer', limit=20)
-        if datasets.empty:
-            raise ValueError("GemmaPy found no datasets for the query 'cancer'.")
-            
-        target = datasets.iloc[0]
-        expr = api.get_dataset_processed_expression(str(target['experiment_ID']))
-        df = expr.to_pandas().select_dtypes(include=[np.number]).dropna()
-        
-        X = df.values if df.shape[0] > df.shape[1] else df.values.T
-        if X.shape[1] > n_features_limit:
+        expr = api.get_dataset_processed_expression(str(exp_id))
+
+        # Handle both DataFrame and objects with to_pandas() method
+        if hasattr(expr, 'to_pandas'):
+            df = expr.to_pandas()
+        else:
+            df = expr
+
+        # Select only numeric columns (expression values)
+        df = df.select_dtypes(include=[np.number])
+
+        # Drop samples (columns) with any NaN before transposing
+        valid_samples = df.columns[df.notna().all()]
+        df = df[valid_samples]
+
+        # Genomics standard: Rows=Genes (features), Cols=Samples (observations)
+        # Shape is typically (genes, samples) -> we need (samples, genes)
+        X = df.values.T  # Transpose: (samples, genes)
+
+        print(f"Data shape after cleanup: {X.shape} (samples × genes)")
+
+        # Subsample to target samples if needed
+        if X.shape[0] > n_samples_target:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(X.shape[0], n_samples_target, replace=False)
+            X = X[idx]
+
+        # Select most variable genes to reach target features
+        if X.shape[1] > n_features_target:
             feature_variances = np.var(X, axis=0)
-            top_feature_indices = np.argsort(feature_variances)[-n_features_limit:]
-            X = X[:, top_feature_indices]
-            
-        print(f"Genomics Data Loaded: {X.shape}")
-        
-        # Since there's no ground truth, use a robust estimate (Spearman) as a reference
+            top_indices = np.argsort(feature_variances)[-n_features_target:]
+            X = X[:, top_indices]
+
+        print(f"Genomics Data Loaded: {X.shape} (samples × genes)")
+
+        if X.shape[0] < 50:
+            print("Warning: Sample size is small. Correlation estimates may be unstable.")
+
+        # Reference using Spearman (robust baseline)
         ref_corr, _ = stats.spearmanr(X)
         return X, ref_corr
-        
+
     except Exception as e:
         print(f"Genomics data fetching failed: {e}")
         return None, None

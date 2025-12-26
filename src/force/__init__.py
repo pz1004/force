@@ -5,6 +5,7 @@ FORCE: Fast Outlier-Robust Correlation Estimation
 This package provides the implementation of the FORCE algorithm and related
 tools for benchmarking and analysis.
 """
+from .trimmed_pearson import TrimmedPearsonExact
 from .core import ForceEstimator
 from .estimators import (
     CorrelationEstimator,
@@ -35,6 +36,7 @@ __all__ = [
     "WinsorizedEstimator",
     "FastMCDEstimator",
     "ExactTrimmedEstimator",
+    "TrimmedPearsonExact",
     # Data Functions
     "generate_synthetic_data",
     "fetch_sp500_data",

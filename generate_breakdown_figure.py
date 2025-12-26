@@ -460,9 +460,9 @@ def main():
     fig = create_simple_breakdown_figure()
     
     # Save in multiple formats
-    fig.savefig(output_path / 'breakdown_validation.pdf', format='pdf')
+    # fig.savefig(output_path / 'breakdown_validation.pdf', format='pdf')
     fig.savefig(output_path / 'breakdown_validation.png', format='png', dpi=300)
-    fig.savefig(output_path / 'breakdown_validation.eps', format='eps')
+    # fig.savefig(output_path / 'breakdown_validation.eps', format='eps')
     
     print(f"Saved: {output_path / 'breakdown_validation.pdf'}")
     

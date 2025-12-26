@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -29,6 +30,9 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+# Add src to path for imports when package is not installed
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # --- Import from the new `force` library structure ---
 from force import (
@@ -39,6 +43,7 @@ from force import (
     SpearmanEstimator,
     WinsorizedEstimator,
 )
+from force.trimmed_pearson import TrimmedPearsonExact
 from force.data import (
     fetch_genomics_data,
     fetch_odds_dataset,
@@ -145,6 +150,8 @@ def main(args: argparse.Namespace) -> None:
     # FastMCD will now run on all datasets by default.
     algorithms_to_run: Dict[str, CorrelationEstimator] = {
         "Pearson": PearsonEstimator(),
+        "TrimmedPearsonExact(no TER)": TrimmedPearsonExact(use_ter=False),
+        "TrimmedPearsonExact(TER)": TrimmedPearsonExact(use_ter=True),       
         "Spearman": SpearmanEstimator(),
         "Winsorized": WinsorizedEstimator(),
         "FastMCD": FastMCDEstimator(),
@@ -158,7 +165,7 @@ def main(args: argparse.Namespace) -> None:
     # 1. Synthetic Data
     logger.info("Preparing Synthetic dataset...")
     X_syn, true_corr_syn = generate_synthetic_data(
-        n_samples=1000, n_features=50, contamination=0.15
+        n_samples=1000, n_features=50, contamination=0.1
     )
     all_results.extend(
         run_benchmark_loop(X_syn, true_corr_syn, "Synthetic", algorithms_to_run, args.runs)
