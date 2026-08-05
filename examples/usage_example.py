@@ -41,8 +41,8 @@ def run_simple_demonstration():
     print(np.round(true_corr, 2))
 
     # 2. Initialize and fit the ForceEstimator
-    # For this small dataset, FORCE will automatically use exact quantiles
-    # because n_samples (100) is <= the `exact_cutover` default of 100.
+    # The default estimator uses pure P² for every valid batch. Pass an
+    # exact_cutover above n_samples to request the optional exact hybrid.
     print("\nInitializing and fitting ForceEstimator...")
     force_estimator = ForceEstimator()
     robust_corr = force_estimator.fit(X)

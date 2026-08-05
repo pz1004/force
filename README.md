@@ -1,66 +1,104 @@
 # FORCE: Fast Outlier-Robust Correlation Estimation
 
-This repository provides the official Python implementation of the FORCE 
-(Fast Outlier-Robust Correlation Estimation) algorithm, as presented in the 
-accompanying paper submitted to MDPI Mathematics (2025).
+This repository contains the Python implementation accompanying the 2026
+*Mathematics* paper “FORCE: Fast Outlier-Robust Correlation Estimation via
+Streaming Quantile Approximation for High-Dimensional Data Streams.”
 
-## Overview
+The default estimator follows the paper’s formal definitions:
 
-FORCE is a robust correlation estimator designed to be computationally efficient 
-while maintaining high accuracy in the presence of outliers. It operates in 
-three stages:
+1. Track marginal quantiles 0.01, 0.25, 0.50, 0.75 and 0.99 with standard P².
+2. Estimate location with the median and scale with `IQR / 1.349`.
+3. Compute the tail expansion ratio and inclusive adaptive bounds.
+4. Compute Pearson correlation on each pair’s jointly accepted observations,
+   centered on that pair’s accepted-sample means.
 
-1.  **Streaming Quantile Estimation:** Utilizes the P² algorithm for a fast,
-    single-pass calculation of statistical quantiles.
-2.  **Adaptive Thresholding:** Employs a novel Tail-Extremity Ratio (TER) to
-    dynamically set trimming bounds for outlier removal.
-3.  **Robust Accumulation:** Computes the final correlation matrix on the 
-    clean subset of the data.
-
-This implementation is optimized with Numba for high-performance computation.
-
-## Project Structure
-
-The project is organized into a modern Python package structure:
-
--   `src/force/`: The core Python package.
-    -   `core.py`: Main `ForceEstimator` implementation.
-    -   `estimators.py`: Comparative estimators (Pearson, Spearman, etc.).
-    -   `data.py`: Data loading and generation utilities.
-    -   `utils.py`: Helper functions for analysis and plotting.
--   `scripts/`: Standalone scripts for running benchmarks and analyses.
-    -   `run_benchmark.py`: Runs a full benchmark suite.
-    -   `run_convergence_analysis.py`: Analyzes the P² algorithm's convergence.
--   `examples/`: Example usage of the `force` library.
--   `tests/`: Unit and integration tests.
+The historical result-generating behavior is available separately as
+`LegacyForceEstimator`; it is not intended for new applications.
 
 ## Installation
 
-To install the required dependencies, run:
+Python 3.10 or newer is required.
 
 ```bash
-pip install -e .[dev]
+python3 -m pip install -e '.[dev]'
 ```
 
-## Quick Start
+## Usage
 
-You can run a simple demonstration of the FORCE estimator using the example script:
+```python
+import numpy as np
+from force import ForceEstimator
+
+X = np.random.default_rng(0).normal(size=(1000, 20))
+correlation = ForceEstimator().fit(X)
+```
+
+`ForceEstimator` accepts:
+
+- `lambda_scale=3.0`
+- `exact_cutover=5` (pure P² for all valid inputs)
+- `use_ter=True`
+- `ter_max=None`
+- `epsilon=1e-10`
+
+Set `exact_cutover` above five to use exact quantiles for smaller batches.
+
+### Robustness caveat
+
+The paper's 25% breakdown proof considers the median and IQR but not the
+default uncapped tail expansion ratio. Because TER uses the 1st and 99th
+percentiles, concentrated one-sided contamination can expand the acceptance
+bounds before the IQR breaks down. Applications exposed to that failure mode
+should set a finite `ter_max` or disable TER after validating the resulting
+bias/efficiency trade-off. `VERIFICATION.md` records the mathematical conflict
+and the Appendix B evidence; the implementation preserves the paper's formal
+uncapped default.
+
+## Reproducible benchmarks
+
+The benchmark runner has two explicit protocols:
 
 ```bash
-python examples/usage_example.py
+# Equation- and prose-faithful defaults
+python3 scripts/run_benchmark.py --protocol paper --runs 20
+
+# Historical committed result-generating settings
+python3 scripts/run_benchmark.py --protocol legacy --runs 20
+
+# Fast offline verification of every dataset/algorithm path
+python3 scripts/run_benchmark.py --protocol paper --smoke --offline
 ```
 
-This will generate synthetic data, compute the robust correlation matrix using
-FORCE, and compare it to the classical Pearson correlation.
+All benchmark and analysis runners accept `--protocol`, `--runs`, `--seed`,
+`--smoke`, `--offline`, `--data-dir`, and `--output-dir`. Outputs include raw
+CSV and strict JSON containing parameters, versions, command line, provenance,
+statuses, timings, and accuracy values. Numerical timing runs force Numba and
+BLAS libraries to one thread, warm throwaway estimators, and time fresh
+instances.
 
-## Running Benchmarks
-
-To replicate the benchmarks from the paper, use the `run_benchmark.py` script:
+Additional production-code checks include:
 
 ```bash
-# Run a full benchmark with 20 runs per dataset
-python scripts/run_benchmark.py --runs 20 --output_dir ./benchmark_results
+python3 scripts/run_convergence_analysis.py --protocol paper
+python3 scripts/run_p2_skewness_diagnostic.py --protocol paper
+python3 scripts/run_ter_contamination_analysis.py --protocol paper
+python3 scripts/run_sp500_volatility_sensitivity.py --protocol paper
+python3 scripts/run_scalability_check.py --protocol paper
 ```
 
-The results, including plots and a markdown summary, will be saved in the
-`benchmark_results` directory.
+The paper does not identify its 50 S&P tickers or its 5000x100 Gemma dataset.
+The paper protocol therefore reports these datasets as `not_reproducible`
+unless the missing ticker manifest or Gemma accession is explicitly supplied.
+It never substitutes synthetic data for a failed real-data download.
+
+## Verification
+
+Run:
+
+```bash
+pytest -q
+```
+
+See `VERIFICATION.md` for the equation-by-equation audit, paper errata,
+commands, observed results, external-data provenance, and remaining
+reproducibility limits.

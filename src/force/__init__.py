@@ -6,7 +6,8 @@ This package provides the implementation of the FORCE algorithm and related
 tools for benchmarking and analysis.
 """
 from .trimmed_pearson import TrimmedPearsonExact
-from .core import ForceEstimator
+from .core import ForceEstimator, P2Quantile, p2_desired_positions
+from .legacy import LegacyForceEstimator
 from .estimators import (
     CorrelationEstimator,
     PearsonEstimator,
@@ -21,14 +22,20 @@ from .data import (
     fetch_odds_dataset,
     fetch_genomics_data,
     generate_synthetic_data_fixed_corr,
+    generate_odds_surrogate,
+    load_odds_dataset,
+    ExternalDataUnavailable,
 )
 from .utils import setup_logging
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     # Core
     "ForceEstimator",
+    "P2Quantile",
+    "p2_desired_positions",
+    "LegacyForceEstimator",
     # Comparative Estimators
     "CorrelationEstimator",
     "PearsonEstimator",
@@ -43,6 +50,9 @@ __all__ = [
     "fetch_odds_dataset",
     "fetch_genomics_data",
     "generate_synthetic_data_fixed_corr",
+    "generate_odds_surrogate",
+    "load_odds_dataset",
+    "ExternalDataUnavailable",
     # Utilities
     "setup_logging",
 ]

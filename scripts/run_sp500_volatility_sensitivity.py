@@ -1,160 +1,170 @@
-"""
-S&P 500 Volatility Sensitivity Analysis.
+"""S&P volatility-reference sensitivity under explicit benchmark protocols."""
 
-This script evaluates correlation estimators' robustness to different
-volatility regimes by comparing against "ground truth" correlations
-estimated from low-volatility market days.
+from __future__ import annotations
 
-Reference correlations are computed from days with volatility below
-specified percentile cutoffs (5%, 10%, 15%), following the manuscript
-methodology of using quiet market periods as stable correlation benchmarks.
-"""
-import numpy as np
-import pandas as pd
+import argparse
+import json
+import os
 import sys
 from pathlib import Path
-from datetime import datetime
+from typing import List, Sequence
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+for _thread_variable in (
+    "NUMBA_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
 
-from force import (
-    fetch_sp500_data,
-    ForceEstimator,
-    PearsonEstimator,
-    SpearmanEstimator,
-    WinsorizedEstimator,
-    FastMCDEstimator,
+import numpy as np
+import pandas as pd
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
+from force.data import ExternalDataUnavailable
+from force.protocols import (
+    DatasetNotReproducible,
+    build_estimator,
+    build_estimators,
+    get_protocol,
+    prepare_dataset,
+)
+from force.reporting import (
+    command_line,
+    environment_metadata,
+    estimator_parameters,
+    write_json,
 )
 
 
-def compute_daily_volatility(returns):
-    """Compute daily volatility as mean absolute return across assets."""
-    # returns: (T, p), consistent with manuscript
-    return np.mean(np.abs(returns), axis=1)
+def reference_corr_low_vol(
+    returns: np.ndarray, cutoff_fraction: float
+) -> np.ndarray:
+    volatility = np.mean(np.abs(returns), axis=1)
+    threshold = np.quantile(volatility, 1.0 - cutoff_fraction)
+    return np.corrcoef(returns[volatility <= threshold], rowvar=False)
 
 
-def reference_corr_low_vol(returns, cutoff_percent):
-    """
-    Compute reference correlation from low-volatility days.
-
-    Args:
-        returns: (T, p) returns matrix
-        cutoff_percent: fraction of high-volatility days to exclude
-                       e.g., 0.10 keeps days below the 90th percentile
-    """
-    vol = compute_daily_volatility(returns)
-    thr = np.quantile(vol, 1.0 - cutoff_percent)
-    idx = vol <= thr
-    X = returns[idx]
-    # Pearson correlation on "stable" days
-    Xc = X - X.mean(axis=0, keepdims=True)
-    cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
-    std = np.sqrt(np.diag(cov)) + 1e-12
-    corr = cov / (std[:, None] * std[None, :])
-    return corr
+def rmse_offdiag(left: np.ndarray, right: np.ndarray) -> float:
+    mask = np.triu(np.ones_like(left, dtype=bool), k=1)
+    return float(np.sqrt(np.mean((left[mask] - right[mask]) ** 2)))
 
 
-def rmse_offdiag(R_hat, R_ref):
-    """Compute RMSE over off-diagonal elements of correlation matrices."""
-    p = R_hat.shape[0]
-    mask = ~np.eye(p, dtype=bool)
-    return float(np.sqrt(np.mean((R_hat[mask] - R_ref[mask]) ** 2)))
+def _tickers(path: str | None) -> Sequence[str] | None:
+    if path is None:
+        return None
+    ticker_path = Path(path)
+    text = ticker_path.read_text(encoding="utf-8")
+    if ticker_path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            payload = payload.get("tickers")
+        if not isinstance(payload, list):
+            raise ValueError("Ticker JSON must be a list or contain 'tickers'.")
+        values = payload
+    else:
+        values = text.replace(",", "\n").splitlines()
+    return tuple(
+        str(value).strip().upper()
+        for value in values
+        if str(value).strip()
+    )
 
 
-def run_sensitivity(returns, estimators, cutoffs=(0.05, 0.10, 0.15)):
-    """
-    Run volatility sensitivity analysis across multiple cutoffs.
-
-    Args:
-        returns: (T, p) full unfiltered returns series
-        estimators: dict mapping name -> callable(returns) -> corr_hat
-        cutoffs: volatility percentile cutoffs for reference correlation
-
-    Returns:
-        List of dicts with cutoff, estimator name, and RMSE values
-    """
-    out = []
-    for c in cutoffs:
-        R_ref = reference_corr_low_vol(returns, cutoff_percent=c)
-
-        for name, est in estimators.items():
-            R_hat = est(returns)  # estimator runs on full data
-            out.append({
-                "cutoff": c,
-                "estimator": name,
-                "rmse": rmse_offdiag(R_hat, R_ref),
-            })
-    return out
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", choices=("paper", "legacy"), default="paper")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--sp500-tickers-file", default=None)
+    parser.add_argument(
+        "--output-dir", default="./verification_results/sp500_sensitivity"
+    )
+    args = parser.parse_args()
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    runs = 1 if args.smoke else args.runs
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema_version": 1,
+        "protocol": get_protocol(args.protocol).as_dict(),
+        "status": "completed",
+        "message": "",
+        "smoke": bool(args.smoke),
+        "offline": bool(args.offline),
+        "data_dir": args.data_dir,
+        "seed": args.seed,
+        "runs": runs,
+        "environment": environment_metadata(),
+        "command_line": command_line(),
+        "estimator_parameters": {
+            name: estimator_parameters(estimator)
+            for name, estimator in build_estimators(args.protocol).items()
+        },
+        "results": [],
+    }
+    try:
+        prepared = prepare_dataset(
+            "sp500",
+            protocol=args.protocol,
+            seed=args.seed,
+            smoke=args.smoke,
+            offline=args.offline,
+            data_dir=Path(args.data_dir) if args.data_dir else None,
+            sp500_tickers=_tickers(args.sp500_tickers_file),
+        )
+        rows: List[dict] = []
+        for cutoff in (0.05, 0.10, 0.15):
+            reference = reference_corr_low_vol(prepared.X, cutoff)
+            for name in build_estimators(args.protocol):
+                for run_id in range(1, runs + 1):
+                    estimator = build_estimator(args.protocol, name)
+                    estimate = estimator.fit(prepared.X)
+                    rows.append(
+                        {
+                            "protocol": args.protocol,
+                            "status": "completed",
+                            "cutoff": cutoff,
+                            "algorithm": name,
+                            "run_id": run_id,
+                            "seed": args.seed,
+                            "rmse": rmse_offdiag(estimate, reference),
+                        }
+                    )
+        report["results"] = rows
+        report["provenance"] = prepared.provenance
+        pd.DataFrame(rows).to_csv(output_dir / "results.csv", index=False)
+    except DatasetNotReproducible as exc:
+        report["status"] = "not_reproducible"
+        report["message"] = str(exc)
+    except ExternalDataUnavailable as exc:
+        report["status"] = "skipped_external"
+        report["message"] = str(exc)
+    except Exception as exc:
+        report["status"] = "failed"
+        report["message"] = str(exc)
+    results_path = output_dir / "results.csv"
+    if not results_path.exists():
+        pd.DataFrame(
+            columns=(
+                "protocol",
+                "status",
+                "cutoff",
+                "algorithm",
+                "run_id",
+                "seed",
+                "rmse",
+            )
+        ).to_csv(results_path, index=False)
+    write_json(output_dir / "report.json", report)
+    return 1 if report["status"] == "failed" else 0
 
 
 if __name__ == "__main__":
-    # Fetch S&P 500 data using the repo's existing loader
-    print("=" * 60)
-    print("S&P 500 Volatility Sensitivity Analysis")
-    print("=" * 60)
-
-    returns, _ = fetch_sp500_data()  # returns shape: (T, p)
-    print(f"Loaded returns matrix: {returns.shape[0]} days × {returns.shape[1]} stocks")
-
-    # Build estimator dictionary using repo's estimator wrappers
-    # Each estimator callable maps returns -> correlation matrix
-    force_est = ForceEstimator()
-    pearson_est = PearsonEstimator()
-    spearman_est = SpearmanEstimator()
-    winsorized_est = WinsorizedEstimator()
-    fastmcd_est = FastMCDEstimator()
-
-    estimators = {
-        "FORCE": lambda X: force_est.fit(X),
-        "Pearson": lambda X: pearson_est.fit(X),
-        "Spearman": lambda X: spearman_est.fit(X),
-        "Winsorized": lambda X: winsorized_est.fit(X),
-        "FastMCD": lambda X: fastmcd_est.fit(X),
-    }
-
-    # Run sensitivity analysis
-    print("\nRunning sensitivity analysis across volatility cutoffs...")
-    results = run_sensitivity(returns, estimators, cutoffs=(0.05, 0.10, 0.15))
-
-    # Display results
-    print("\n" + "-" * 60)
-    print(f"{'Cutoff':<10} {'Estimator':<15} {'RMSE':<10}")
-    print("-" * 60)
-
-    for r in results:
-        print(f"{r['cutoff']:<10.2f} {r['estimator']:<15} {r['rmse']:<10.4f}")
-
-    # Summary by estimator (average across cutoffs)
-    print("\n" + "=" * 60)
-    print("Summary: Average RMSE across all cutoffs")
-    print("=" * 60)
-
-    from collections import defaultdict
-    avg_rmse = defaultdict(list)
-    for r in results:
-        avg_rmse[r['estimator']].append(r['rmse'])
-
-    sorted_estimators = sorted(avg_rmse.items(), key=lambda x: np.mean(x[1]))
-    for name, rmses in sorted_estimators:
-        print(f"{name:<15}: {np.mean(rmses):.4f}")
-
-    # Save results to CSV
-    output_dir = Path(__file__).parent.parent / "results"
-    output_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"sp500_volatility_sensitivity_{timestamp}.csv"
-
-    df = pd.DataFrame(results)
-    df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-
-    # Also save summary
-    summary_data = [{"estimator": name, "avg_rmse": np.mean(rmses)}
-                    for name, rmses in sorted_estimators]
-    summary_file = output_dir / f"sp500_volatility_sensitivity_summary_{timestamp}.csv"
-    pd.DataFrame(summary_data).to_csv(summary_file, index=False)
-    print(f"Summary saved to: {summary_file}")
-
-    print("\nAnalysis complete.")
+    raise SystemExit(main())

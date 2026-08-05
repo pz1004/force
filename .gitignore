@@ -122,4 +122,6 @@ benchmark_results/
 benchmark_results_new/
 benchmark_results_old/
 convergence_results/
+verification_results/
+.force-data/
 force.log

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "force-estimator"
-version = "1.0.0"
+version = "1.1.0"
 authors = [
   { name="Sooyoung Jang", email="syjang@hanbat.ac.kr" },
 ]
 description = "A fast, outlier-robust correlation estimator."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -27,7 +27,7 @@ dependencies = [
     "seaborn",
     "numba",
     "yfinance",
-    "gemmapy",
+    "tabulate",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +36,14 @@ dev = [
     "black",
     "isort",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--capture=no"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.urls]
 "Homepage" = "https://github.com/pz1004/force"

@@ -1,137 +1,173 @@
+"""Diagnose production P² quantile accuracy on skewed distributions."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Callable, Iterable, List
+
+for _thread_variable in (
+    "NUMBA_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
+
 import numpy as np
+import pandas as pd
 
-class P2Quantile:
-    """
-    Minimal P² quantile estimator (5 markers), suitable for diagnostics.
-    This is not meant to replace your repo implementation—use it only if you
-    cannot easily call the existing P² estimator objects.
-    """
-    def __init__(self, phi: float):
-        assert 0.0 < phi < 1.0
-        self.phi = phi
-        self.n = 0
-        self.q = None
-        self.ni = None
-        self.ni_des = None
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-    def update(self, x: float):
-        if self.n < 5:
-            if self.q is None:
-                self.q = []
-            self.q.append(x)
-            self.n += 1
-            if self.n == 5:
-                self.q.sort()
-                self.q = np.array(self.q, dtype=np.float64)
-                self.ni = np.array([1, 2, 3, 4, 5], dtype=np.int64)
-                self.ni_des = self._desired_positions(5)
-            return
-
-        # Find cell k
-        k = 0
-        if x < self.q[0]:
-            self.q[0] = x
-            k = 0
-        elif x >= self.q[4]:
-            self.q[4] = x
-            k = 3
-        else:
-            for i in range(1, 5):
-                if self.q[i - 1] <= x < self.q[i]:
-                    k = i - 1
-                    break
-
-        self.n += 1
-        for i in range(k + 1, 5):
-            self.ni[i] += 1
-
-        self.ni_des = self._desired_positions(self.n)
-
-        for i in [1, 2, 3]:
-            d = self.ni_des[i] - self.ni[i]
-            if (d >= 1 and self.ni[i + 1] - self.ni[i] > 1) or (d <= -1 and self.ni[i] - self.ni[i - 1] > 1):
-                di = 1 if d >= 1 else -1
-                q_new = self._parabolic(i, di)
-                if self.q[i - 1] < q_new < self.q[i + 1]:
-                    self.q[i] = q_new
-                else:
-                    self.q[i] = self._linear(i, di)
-                self.ni[i] += di
-
-    def value(self) -> float:
-        if self.n == 0:
-            return np.nan
-        if self.n < 5:
-            # crude fallback
-            arr = np.sort(np.array(self.q, dtype=np.float64))
-            idx = int(np.floor(self.phi * (len(arr) - 1)))
-            return float(arr[idx])
-        return float(self.q[2])
-
-    def _desired_positions(self, N: int):
-        phi = self.phi
-        # Common P² desired positions for 5 markers:
-        # n'_0 = 1
-        # n'_1 = 1 + 2*phi*(N-1)
-        # n'_2 = 1 + 4*phi*(N-1)/2 = 1 + 2*phi*(N-1)
-        # n'_3 = 1 + 2*(1+phi)*(N-1)
-        # n'_4 = N
-        # (We implement a consistent monotone scheme.)
-        return np.array([
-            1,
-            1 + 2 * phi * (N - 1),
-            1 + 4 * phi * (N - 1) / 2.0,
-            1 + 2 * (1 + phi) * (N - 1),
-            N
-        ], dtype=np.float64)
-
-    def _parabolic(self, i: int, d: int) -> float:
-        q, n = self.q, self.ni.astype(np.float64)
-        num = d / (n[i + 1] - n[i - 1])
-        a = (n[i] - n[i - 1] + d) * (q[i + 1] - q[i]) / (n[i + 1] - n[i])
-        b = (n[i + 1] - n[i] - d) * (q[i] - q[i - 1]) / (n[i] - n[i - 1])
-        return q[i] + num * (a + b)
-
-    def _linear(self, i: int, d: int) -> float:
-        q, n = self.q, self.ni.astype(np.float64)
-        return q[i] + d * (q[i + d] - q[i]) / (n[i + d] - n[i])
+from force import P2Quantile
+from force.legacy import _legacy_p_square_kernel
+from force.protocols import get_protocol
+from force.reporting import command_line, environment_metadata, write_json
 
 
-def run_skew_diagnostic(dist_name: str, sampler, phis=(0.01, 0.25, 0.5, 0.75, 0.99), Ns=(200, 500, 1000, 2000, 5000), reps=30):
-    print(f"\n== {dist_name} ==")
-    for N in Ns:
-        errs = {phi: [] for phi in phis}
-        for _ in range(reps):
-            x = sampler(N)
-            # exact quantiles (reference)
-            q_ref = {phi: float(np.quantile(x, phi)) for phi in phis}
-            # P2 estimates
-            ests = {phi: P2Quantile(phi) for phi in phis}
-            for val in x:
-                for phi in phis:
-                    ests[phi].update(float(val))
-            for phi in phis:
-                errs[phi].append(abs(ests[phi].value() - q_ref[phi]))
-        msg = "N={:5d} | ".format(N) + " ".join([f"phi={phi:0.2f}: MAE={np.mean(errs[phi]):.4g}" for phi in phis])
-        print(msg)
+def _estimate(values: np.ndarray, probability: float, protocol: str) -> float:
+    if protocol == "legacy":
+        result = _legacy_p_square_kernel(
+            np.asarray(values, dtype=np.float64),
+            np.array([probability], dtype=np.float64),
+        )
+        return float(result[0])
+    tracker = P2Quantile(probability)
+    for value in values:
+        tracker.update(float(value))
+    return tracker.value
 
 
-def main():
-    rng = np.random.default_rng(0)
+def run_diagnostic(
+    *,
+    distribution: str,
+    sampler: Callable[[int], np.ndarray],
+    probabilities: Iterable[float],
+    sample_sizes: Iterable[int],
+    repetitions: int,
+    protocol: str,
+) -> List[dict]:
+    rows: List[dict] = []
+    for n_samples in sample_sizes:
+        errors = {probability: [] for probability in probabilities}
+        rank_errors = {probability: [] for probability in probabilities}
+        for _ in range(repetitions):
+            values = np.asarray(sampler(n_samples), dtype=np.float64)
+            for probability in probabilities:
+                exact = float(np.quantile(values, probability))
+                estimate = _estimate(values, probability, protocol)
+                errors[probability].append(abs(estimate - exact))
+                empirical_rank = float(np.mean(values <= estimate))
+                rank_errors[probability].append(
+                    abs(empirical_rank - probability)
+                )
+        for probability in probabilities:
+            rows.append(
+                {
+                    "distribution": distribution,
+                    "protocol": protocol,
+                    "status": "completed",
+                    "n_samples": n_samples,
+                    "probability": probability,
+                    "repetitions": repetitions,
+                    "mean_absolute_error": float(
+                        np.mean(errors[probability])
+                    ),
+                    "mean_rank_error": float(
+                        np.mean(rank_errors[probability])
+                    ),
+                }
+            )
+    return rows
 
-    run_skew_diagnostic(
-        "Lognormal(0,1) (right-skew)",
-        lambda N: rng.lognormal(mean=0.0, sigma=1.0, size=N),
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", choices=("paper", "legacy"), default="paper")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Deprecated alias for --runs.",
     )
-    run_skew_diagnostic(
-        "Skew-normal(a=10) approx (right-skew via exp)",
-        lambda N: np.exp(rng.normal(size=N)),
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument(
+        "--output-dir",
+        default="./verification_results/p2_diagnostic",
     )
-    run_skew_diagnostic(
-        "Left-skew (negated lognormal)",
-        lambda N: -rng.lognormal(mean=0.0, sigma=1.0, size=N),
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Deprecated direct JSON path; prefer --output-dir.",
     )
+    args = parser.parse_args()
+    requested_runs = (
+        args.repetitions if args.repetitions is not None else args.runs
+    )
+    if requested_runs < 1:
+        parser.error("--runs must be at least 1")
+    repetitions = 2 if args.smoke else requested_runs
+    sample_sizes = (200, 1000) if args.smoke else (200, 500, 1000, 2000, 5000)
+    probabilities = (0.01, 0.25, 0.50, 0.75, 0.99)
+    rng = np.random.default_rng(args.seed)
+    rows: List[dict] = []
+    rows.extend(
+        run_diagnostic(
+            distribution="lognormal",
+            sampler=lambda size: rng.lognormal(0.0, 1.0, size),
+            probabilities=probabilities,
+            sample_sizes=sample_sizes,
+            repetitions=repetitions,
+            protocol=args.protocol,
+        )
+    )
+    rows.extend(
+        run_diagnostic(
+            distribution="negative_lognormal",
+            sampler=lambda size: -rng.lognormal(0.0, 1.0, size),
+            probabilities=probabilities,
+            sample_sizes=sample_sizes,
+            repetitions=repetitions,
+            protocol=args.protocol,
+        )
+    )
+    for row in rows:
+        row["seed"] = args.seed
+    output_dir = (
+        Path(args.output).parent if args.output else Path(args.output_dir)
+    )
+    report_path = (
+        Path(args.output) if args.output else output_dir / "report.json"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_dir / "results.csv", index=False)
+    write_json(
+        report_path,
+        {
+            "schema_version": 1,
+            "status": "completed",
+            "protocol": get_protocol(args.protocol).as_dict(),
+            "smoke": bool(args.smoke),
+            "offline": bool(args.offline),
+            "data_dir": args.data_dir,
+            "seed": args.seed,
+            "runs": repetitions,
+            "sample_sizes": list(sample_sizes),
+            "probabilities": list(probabilities),
+            "environment": environment_metadata(),
+            "command_line": command_line(),
+            "results": rows,
+        },
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,59 +1,86 @@
-"""
-Tests for the comparative estimators.
-"""
+"""Validation of benchmark estimators and compatibility wrappers."""
+
+from __future__ import annotations
+
 import numpy as np
 import pytest
 
 from force import (
+    ExactTrimmedEstimator,
+    FastMCDEstimator,
     PearsonEstimator,
     SpearmanEstimator,
+    TrimmedPearsonExact,
     WinsorizedEstimator,
-    FastMCDEstimator,
-    ExactTrimmedEstimator,
 )
-from force.data import generate_synthetic_data
+
 
 @pytest.fixture
-def synthetic_data():
-    """Provides a small synthetic dataset for testing."""
-    X, _ = generate_synthetic_data(n_samples=100, n_features=4, contamination=0.1)
-    return X
+def data() -> np.ndarray:
+    return np.random.default_rng(3).normal(size=(100, 4))
 
-# A list of all estimator classes to be tested
-ESTIMATOR_CLASSES = [
-    PearsonEstimator,
-    SpearmanEstimator,
-    WinsorizedEstimator,
-    FastMCDEstimator,
-    ExactTrimmedEstimator,
-]
 
-@pytest.mark.parametrize("EstimatorClass", ESTIMATOR_CLASSES)
-def test_estimator_runs(EstimatorClass, synthetic_data):
-    """
-    Tests that each comparative estimator can be initialized and run.
-    This acts as a basic smoke test.
-    """
-    try:
-        estimator = EstimatorClass()
-        result = estimator.fit(synthetic_data)
-        
-        # Basic validation of the output
-        assert isinstance(result, np.ndarray), "Estimator must return a NumPy array"
-        assert result.shape == (4, 4), "Output correlation matrix shape is incorrect"
-        assert np.allclose(np.diag(result), 1.0), "Diagonal of a corr matrix must be 1"
-        assert np.all(result >= -1.0) and np.all(result <= 1.0), "All values must be in [-1, 1]"
-        
-    except Exception as e:
-        pytest.fail(f"{EstimatorClass.__name__} raised an exception during fit: {e}")
+@pytest.mark.parametrize(
+    "estimator",
+    [
+        PearsonEstimator(),
+        SpearmanEstimator(),
+        WinsorizedEstimator(),
+        FastMCDEstimator(),
+        TrimmedPearsonExact(),
+        TrimmedPearsonExact(use_ter=True),
+    ],
+)
+def test_estimator_output_contract(estimator, data: np.ndarray) -> None:
+    result = estimator.fit(data)
+    assert result.shape == (4, 4)
+    assert np.all(np.isfinite(result))
+    assert np.allclose(result, result.T)
+    assert np.array_equal(np.diag(result), np.ones(4))
+    assert result.min() >= -1.0
+    assert result.max() <= 1.0
 
-def test_spearman_for_two_features():
-    """
-    `scipy.stats.spearmanr` returns a float for 2 features, not a matrix.
-    This test ensures our wrapper handles that case correctly.
-    """
-    X = np.random.rand(10, 2)
-    estimator = SpearmanEstimator()
-    result = estimator.fit(X)
-    assert result.shape == (2, 2), "Spearman should return a 2x2 matrix for 2 features"
-    assert np.allclose(np.diag(result), 1.0), "Diagonal should be 1"
+
+def test_zero_variance_baseline_output_is_finite() -> None:
+    X = np.column_stack((np.arange(10.0), np.ones(10), np.arange(10.0)))
+    result = PearsonEstimator().fit(X)
+    assert np.all(np.isfinite(result))
+    assert result[0, 1] == 0.0
+    assert result[1, 2] == 0.0
+
+
+def test_fastmcd_does_not_silently_fallback() -> None:
+    X = np.ones((10, 3))
+    with pytest.warns(UserWarning, match="not full rank"):
+        with pytest.raises(Exception):
+            FastMCDEstimator().fit(X)
+
+
+def test_exact_trimmed_compatibility_wrapper(data: np.ndarray) -> None:
+    with pytest.warns(DeprecationWarning):
+        compatibility = ExactTrimmedEstimator()
+    expected = TrimmedPearsonExact(use_ter=True).fit(data)
+    assert np.allclose(compatibility.fit(data), expected)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        (-0.1, 0.1),
+        (0.5, 0.0),
+        (0.1,),
+        (0.1, 0.1, 0.1),
+        (True, 0.1),
+        (np.nan, 0.1),
+        None,
+    ],
+)
+def test_winsorized_limits_validation(limits) -> None:
+    with pytest.raises(ValueError):
+        WinsorizedEstimator(limits)
+
+
+@pytest.mark.parametrize("support_fraction", [True, 0.0, 1.1, np.nan, "bad"])
+def test_fastmcd_support_fraction_validation(support_fraction) -> None:
+    with pytest.raises(ValueError):
+        FastMCDEstimator(support_fraction=support_fraction)

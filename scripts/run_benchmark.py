@@ -1,247 +1,388 @@
-"""
-================================================================================
-FORCE Benchmark Runner
-================================================================================
+"""Run FORCE benchmarks under an equation-faithful or legacy protocol."""
 
-This script runs a comprehensive benchmark comparing the FORCE estimator against
-several other standard and robust correlation estimators.
-
-Key Features:
-- Runs experiments multiple times for statistical significance.
-- Includes a warm-up phase to mitigate JIT compilation overhead in timings.
-- Calculates mean, standard deviation, and 95% confidence intervals.
-- Generates a summary markdown table and plots.
-
-Usage:
-    # Run a standard benchmark with 20 iterations per dataset
-    python scripts/run_benchmark.py --runs 20 --output_dir ./benchmark_results
-
-    # Run only the FastMCD algorithm (computationally intensive)
-    python scripts/run_benchmark.py --only-fastmcd --runs 5
-"""
+from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
-import time
+import warnings
 from pathlib import Path
-from typing import Dict, List
-from datetime import datetime
+from time import perf_counter_ns
+from typing import Any, Dict, Iterable, List, Sequence
+
+for _thread_variable in (
+    "NUMBA_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
 
 import numpy as np
 import pandas as pd
 
-# Add src to path for imports when package is not installed
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-# --- Import from the new `force` library structure ---
-from force import (
-    CorrelationEstimator,
-    FastMCDEstimator,
-    ForceEstimator,
-    PearsonEstimator,
-    SpearmanEstimator,
-    WinsorizedEstimator,
+from force.data import ExternalDataUnavailable
+from force.protocols import (
+    DATASET_NAMES,
+    DatasetNotReproducible,
+    build_estimator,
+    build_estimators,
+    get_protocol,
+    prepare_dataset,
 )
-from force.trimmed_pearson import TrimmedPearsonExact
-from force.data import (
-    fetch_genomics_data,
-    fetch_odds_dataset,
-    fetch_sp500_data,
-    generate_synthetic_data,
-)
-from force.utils import (
-    BenchmarkResult,
-    generate_benchmark_plots,
-    generate_markdown_report,
-    setup_logging,
+from force.reporting import (
+    command_line,
+    environment_metadata,
+    estimator_parameters,
+    write_json,
 )
 
-# --- Basic logger setup ---
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
-logger = logging.getLogger("BenchmarkRunner")
+
+LOGGER = logging.getLogger("force.benchmark")
 
 
-def run_benchmark_loop(
+def off_diagonal_rmse(
+    estimate: np.ndarray, reference: np.ndarray
+) -> float:
+    if estimate.shape != reference.shape or estimate.ndim != 2:
+        raise ValueError("Estimate and reference must be equal-sized matrices.")
+    mask = np.triu(np.ones_like(estimate, dtype=bool), k=1)
+    return float(np.sqrt(np.mean((estimate[mask] - reference[mask]) ** 2)))
+
+
+def _parse_datasets(value: str) -> List[str]:
+    datasets = [part.strip() for part in value.split(",") if part.strip()]
+    unknown = sorted(set(datasets) - set(DATASET_NAMES))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"Unknown datasets: {', '.join(unknown)}"
+        )
+    if not datasets:
+        raise argparse.ArgumentTypeError("At least one dataset is required.")
+    return datasets
+
+
+def _read_tickers(path: Path) -> Sequence[str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            payload = payload.get("tickers")
+        if not isinstance(payload, list):
+            raise ValueError("Ticker JSON must be a list or contain 'tickers'.")
+        values = payload
+    else:
+        values = text.replace(",", "\n").splitlines()
+    tickers = tuple(str(value).strip().upper() for value in values if str(value).strip())
+    return tickers
+
+
+def run_dataset(
+    *,
+    dataset_name: str,
     X: np.ndarray,
-    true_corr: np.ndarray,
-    dataset_label: str,
-    algorithms: Dict[str, CorrelationEstimator],
-    n_runs: int,
-) -> List[BenchmarkResult]:
-    """
-    Executes the benchmark loop for a single dataset.
-
-    This function performs a warm-up run, followed by a specified number of
-    measurement runs for each algorithm on the given dataset.
-
-    Args:
-        X: The input data matrix.
-        true_corr: The ground truth correlation matrix for RMSE calculation.
-        dataset_label: A string label for the dataset being tested.
-        algorithms: A dictionary of algorithm names to estimator instances.
-        n_runs: The number of times to run the benchmark for each algorithm.
-
-    Returns:
-        A list of BenchmarkResult objects containing the detailed results.
-    """
-    results = []
-    n_samples, n_features = X.shape
-    logger.info(
-        "--- Benchmarking %s (N=%d, D=%d, Runs=%d) ---",
-        dataset_label, n_samples, n_features, n_runs,
-    )
-
-    for algo_name, estimator in algorithms.items():
-        # 1. Warm-up Phase (to account for JIT compilation, etc.)
+    reference: np.ndarray,
+    protocol: str,
+    runs: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    algorithms = tuple(build_estimators(protocol))
+    for algorithm in algorithms:
+        warmup_estimator = build_estimator(protocol, algorithm)
+        parameters = estimator_parameters(warmup_estimator)
         try:
-            estimator.fit(X)
-        except Exception as e:
-            logger.error("Warm-up failed for %s on %s: %s", algo_name, dataset_label, e)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                warmup_estimator.fit(X)  # Throwaway warm-up, never timed.
+        except Exception as exc:
+            rows.append(
+                {
+                    "protocol": protocol,
+                    "dataset": dataset_name,
+                    "algorithm": algorithm,
+                    "run_id": None,
+                    "seed": seed,
+                    "n_samples": int(X.shape[0]),
+                    "n_features": int(X.shape[1]),
+                    "time_ms": None,
+                    "rmse": None,
+                    "status": "failed",
+                    "message": f"warm-up failed: {exc}",
+                    "warning_count": 0,
+                    "estimator_parameters": json.dumps(
+                        parameters, sort_keys=True
+                    ),
+                }
+            )
             continue
 
-        # 2. Measurement Phase
-        timings = []
-        for i in range(n_runs):
+        for run_id in range(1, runs + 1):
+            estimator = build_estimator(protocol, algorithm)
             try:
-                start_time = time.time()
-                est_corr = estimator.fit(X)
-                duration_ms = (time.time() - start_time) * 1000
-
-                mask = np.triu(np.ones_like(est_corr, dtype=bool), k=1)
-                rmse = np.sqrt(np.mean((est_corr[mask] - true_corr[mask]) ** 2))
-
-                results.append(
-                    BenchmarkResult(
-                        dataset=dataset_label,
-                        n_samples=n_samples,
-                        n_features=n_features,
-                        algorithm=algo_name,
-                        run_id=i + 1,
-                        time_ms=duration_ms,
-                        rmse=rmse,
-                    )
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always")
+                    start = perf_counter_ns()
+                    estimate = estimator.fit(X)
+                    elapsed_ms = (perf_counter_ns() - start) / 1_000_000.0
+                rows.append(
+                    {
+                        "protocol": protocol,
+                        "dataset": dataset_name,
+                        "algorithm": algorithm,
+                        "run_id": run_id,
+                        "seed": seed,
+                        "n_samples": int(X.shape[0]),
+                        "n_features": int(X.shape[1]),
+                        "time_ms": float(elapsed_ms),
+                        "rmse": off_diagonal_rmse(estimate, reference),
+                        "status": "completed",
+                        "message": (
+                            str(captured[0].message) if captured else ""
+                        ),
+                        "warning_count": len(captured),
+                        "estimator_parameters": json.dumps(
+                            estimator_parameters(estimator), sort_keys=True
+                        ),
+                    }
                 )
-                timings.append(duration_ms)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "protocol": protocol,
+                        "dataset": dataset_name,
+                        "algorithm": algorithm,
+                        "run_id": run_id,
+                        "seed": seed,
+                        "n_samples": int(X.shape[0]),
+                        "n_features": int(X.shape[1]),
+                        "time_ms": None,
+                        "rmse": None,
+                        "status": "failed",
+                        "message": str(exc),
+                        "warning_count": 0,
+                        "estimator_parameters": json.dumps(
+                            estimator_parameters(estimator), sort_keys=True
+                        ),
+                    }
+                )
+    return rows
 
-            except Exception as e:
-                logger.error("Run %d failed for %s on %s: %s", i + 1, algo_name, dataset_label, e)
 
-        if timings:
-            logger.info("%-15s | Avg Time: %6.2fms", algo_name, np.mean(timings))
+def _summary_records(frame: pd.DataFrame) -> List[Dict[str, Any]]:
+    completed = frame[frame["status"] == "completed"].copy()
+    if completed.empty:
+        return []
 
-    return results
-
-
-def main(args: argparse.Namespace) -> None:
-    """
-    Main function to orchestrate the benchmark execution.
-    """
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Add a timestamp to all output files
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    setup_logging(out_dir / f"benchmark_{timestamp}.log")
-
-    # --- Initialize Algorithms ---
-    # The order in this dictionary determines the execution order.
-    # FastMCD will now run on all datasets by default.
-    algorithms_to_run: Dict[str, CorrelationEstimator] = {
-        "Pearson": PearsonEstimator(),
-        "TrimmedPearsonExact(no TER)": TrimmedPearsonExact(use_ter=False),
-        "TrimmedPearsonExact(TER)": TrimmedPearsonExact(use_ter=True),       
-        "Spearman": SpearmanEstimator(),
-        "Winsorized": WinsorizedEstimator(),
-        "FastMCD": FastMCDEstimator(),
-        "FORCE": ForceEstimator(),
-    }
-
-    all_results: List[BenchmarkResult] = []
-
-    # --- Dataset Execution Loop ---
-
-    # 1. Synthetic Data
-    logger.info("Preparing Synthetic dataset...")
-    X_syn, true_corr_syn = generate_synthetic_data(
-        n_samples=1000, n_features=50, contamination=0.1
+    records: List[Dict[str, Any]] = []
+    groups = completed.groupby(
+        ["protocol", "dataset", "algorithm"], observed=True, sort=True
     )
-    all_results.extend(
-        run_benchmark_loop(X_syn, true_corr_syn, "Synthetic", algorithms_to_run, args.runs)
-    )
-
-    # 2. S&P 500 Data
-    try:
-        logger.info("Preparing S&P 500 dataset...")
-        X_sp, true_corr_sp = fetch_sp500_data()
-        all_results.extend(
-            run_benchmark_loop(X_sp, true_corr_sp, "SP500", algorithms_to_run, args.runs)
+    for (protocol, dataset, algorithm), group in groups:
+        runs = int(len(group))
+        time_values = group["time_ms"].to_numpy(dtype=float)
+        rmse_values = group["rmse"].to_numpy(dtype=float)
+        std_time = float(np.std(time_values, ddof=1)) if runs > 1 else None
+        std_rmse = float(np.std(rmse_values, ddof=1)) if runs > 1 else None
+        records.append(
+            {
+                "protocol": str(protocol),
+                "dataset": str(dataset),
+                "algorithm": str(algorithm),
+                "runs": runs,
+                "mean_time_ms": float(np.mean(time_values)),
+                "std_time_ms": std_time,
+                "ci95_time_ms": (
+                    1.96 * std_time / np.sqrt(runs)
+                    if std_time is not None
+                    else None
+                ),
+                "mean_rmse": float(np.mean(rmse_values)),
+                "std_rmse": std_rmse,
+                "ci95_rmse": (
+                    1.96 * std_rmse / np.sqrt(runs)
+                    if std_rmse is not None
+                    else None
+                ),
+            }
         )
-    except Exception as e:
-        logger.error("Skipping S&P 500 dataset: %s", e)
+    return records
 
-    # 3. ODDS Datasets
-    for odds_name in ["mammography", "satellite"]:
+
+def _summary_markdown(summary_records: List[Dict[str, Any]]) -> str:
+    if not summary_records:
+        return "# FORCE benchmark summary\n\nNo completed measurements.\n"
+    summary = pd.DataFrame.from_records(summary_records)
+    return "# FORCE benchmark summary\n\n" + summary.to_markdown(index=False) + "\n"
+
+
+def execute(args: argparse.Namespace) -> Dict[str, Any]:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    runs = 1 if args.smoke else args.runs
+    tickers = (
+        _read_tickers(Path(args.sp500_tickers_file))
+        if args.sp500_tickers_file
+        else None
+    )
+    protocol = get_protocol(args.protocol)
+    result_rows: List[Dict[str, Any]] = []
+    dataset_records: List[Dict[str, Any]] = []
+
+    for dataset_name in args.datasets:
+        LOGGER.info("Preparing %s under %s protocol", dataset_name, args.protocol)
         try:
-            logger.info("Preparing ODDS-%s dataset...", odds_name)
-            X_odds, true_corr_odds = fetch_odds_dataset(odds_name)
-            all_results.extend(
-                run_benchmark_loop(
-                    X_odds, true_corr_odds, f"ODDS-{odds_name}", algorithms_to_run, args.runs
+            prepared = prepare_dataset(
+                dataset_name,
+                protocol=args.protocol,
+                seed=args.seed,
+                smoke=args.smoke,
+                offline=args.offline,
+                data_dir=data_dir,
+                sp500_tickers=tickers,
+                gemma_dataset=args.gemma_dataset,
+            )
+            dataset_records.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "completed",
+                    "shape": list(prepared.X.shape),
+                    "provenance": prepared.provenance,
+                    "message": "",
+                }
+            )
+            result_rows.extend(
+                run_dataset(
+                    dataset_name=dataset_name,
+                    X=prepared.X,
+                    reference=prepared.reference,
+                    protocol=args.protocol,
+                    runs=runs,
+                    seed=args.seed,
                 )
             )
-        except Exception as e:
-            logger.error("Skipping ODDS-%s dataset: %s", odds_name, e)
-    
-    # 4. Genomics Data
-    try:
-        logger.info("Preparing Genomics dataset...")
-        X_gen, ref_corr_gen = fetch_genomics_data()
-        if X_gen is not None:
-            all_results.extend(
-                run_benchmark_loop(X_gen, ref_corr_gen, "Genomics", algorithms_to_run, args.runs)
+        except DatasetNotReproducible as exc:
+            dataset_records.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "not_reproducible",
+                    "shape": None,
+                    "provenance": {},
+                    "message": str(exc),
+                }
             )
-    except Exception as e:
-        logger.error("Skipping Genomics dataset: %s", e)
+        except ExternalDataUnavailable as exc:
+            dataset_records.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "skipped_external",
+                    "shape": None,
+                    "provenance": {},
+                    "message": str(exc),
+                }
+            )
+        except Exception as exc:
+            dataset_records.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "failed",
+                    "shape": None,
+                    "provenance": {},
+                    "message": str(exc),
+                }
+            )
+
+    columns = [
+        "protocol",
+        "dataset",
+        "algorithm",
+        "run_id",
+        "seed",
+        "n_samples",
+        "n_features",
+        "time_ms",
+        "rmse",
+        "status",
+        "message",
+        "warning_count",
+        "estimator_parameters",
+    ]
+    frame = pd.DataFrame(result_rows, columns=columns)
+    summaries = _summary_records(frame)
+    frame.to_csv(output_dir / "results_raw.csv", index=False)
+    (output_dir / "summary.md").write_text(
+        _summary_markdown(summaries), encoding="utf-8"
+    )
+    dataset_statuses = {record["status"] for record in dataset_records}
+    result_statuses = {row["status"] for row in result_rows}
+    if "failed" in dataset_statuses or "failed" in result_statuses:
+        aggregate_status = "failed"
+    elif "completed" in dataset_statuses:
+        aggregate_status = "completed"
+    elif "not_reproducible" in dataset_statuses:
+        aggregate_status = "not_reproducible"
+    elif "skipped_external" in dataset_statuses:
+        aggregate_status = "skipped_external"
+    else:
+        aggregate_status = "completed"
+    report = {
+        "schema_version": 1,
+        "status": aggregate_status,
+        "protocol": protocol.as_dict(),
+        "smoke": bool(args.smoke),
+        "offline": bool(args.offline),
+        "seed": int(args.seed),
+        "requested_runs": int(runs),
+        "environment": environment_metadata(),
+        "command_line": command_line(),
+        "data_dir": str(data_dir) if data_dir is not None else None,
+        "estimator_parameters": {
+            name: estimator_parameters(estimator)
+            for name, estimator in build_estimators(args.protocol).items()
+        },
+        "datasets": dataset_records,
+        "summaries": summaries,
+        "results": result_rows,
+    }
+    write_json(output_dir / "report.json", report)
+    return report
 
 
-    # --- Reporting ---
-    if not all_results:
-        logger.error("No results were collected. Aborting reporting.")
-        return
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--protocol", choices=("paper", "legacy"), default="paper")
+    parser.add_argument(
+        "--datasets",
+        type=_parse_datasets,
+        default=list(DATASET_NAMES),
+        help="Comma-separated dataset names.",
+    )
+    parser.add_argument("--runs", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output-dir", default="./benchmark_results")
+    parser.add_argument("--sp500-tickers-file", default=None)
+    parser.add_argument("--gemma-dataset", default=None)
+    return parser
 
-    df = pd.DataFrame(all_results)
-    
-    # Reorder algorithms in DataFrame to match execution order for reporting
-    algo_order = list(algorithms_to_run.keys())
-    df['algorithm'] = pd.Categorical(df['algorithm'], categories=algo_order, ordered=True)
-    df = df.sort_values(by=['dataset', 'algorithm'])
-    
-    # Save raw data
-    raw_path = out_dir / f"results_raw_{timestamp}.csv"
-    df.to_csv(raw_path, index=False)
-    logger.info("Raw results saved to %s", raw_path)
 
-    # Generate Markdown report and plots
-    md_path = out_dir / f"summary_table_{timestamp}.md"
-    generate_markdown_report(df, md_path)
-
-    plot_path = out_dir / f"benchmark_plots_{timestamp}.png"
-    generate_benchmark_plots(df, plot_path)
-
-    logger.info("Benchmark Complete.")
+def main(argv: Iterable[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    report = execute(args)
+    return 1 if report["status"] == "failed" else 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run FORCE Benchmarks")
-    parser.add_argument(
-        "--runs", type=int, default=20, help="Number of measured runs per experiment."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./benchmark_results",
-        help="Directory to save benchmark results, logs, and plots.",
-    )
-    main(parser.parse_args())
+    raise SystemExit(main())
