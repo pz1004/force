@@ -1,8 +1,9 @@
 """
-Script to update LaTeX tables in template_revised.tex with benchmark results.
+Regenerate archival LaTeX tables from the committed December 2025 results.
 
-This script reads the benchmark results CSV and generates updated LaTeX table content,
-then automatically updates the template file.
+This historical script uses the fixed CSV named below and updates the template
+file. Current paper-mode results and identity-matched paired timing tests are
+produced by scripts/run_benchmark.py; this script is not their report exporter.
 
 Tables updated:
 1. Table 1 (tab:fastmcd_baseline) - FastMCD baseline performance

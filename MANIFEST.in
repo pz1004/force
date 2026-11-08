@@ -1,0 +1,12 @@
+include LICENSE README.md CITATION.cff VERIFICATION.md
+include .gitignore
+include force-improvement-plan.md
+include mathematics-14-00191.pdf
+include generate_figures.py generate_breakdown_figure.py
+recursive-include .github/workflows *.yml
+recursive-include examples *.py
+recursive-include scripts *.py
+recursive-include tools *.py
+recursive-include tests *.py
+recursive-include archive *.md *.json *.png *.csv *.py *.txt
+global-exclude __pycache__ *.py[cod]

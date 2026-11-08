@@ -1,366 +1,58 @@
-"""Core implementation of the FORCE robust correlation estimator."""
+"""FORCE's final-bound, pairwise trimmed estimator (Algorithm 1)."""
 
 from __future__ import annotations
 
-import logging
+import hashlib
 import warnings
+from math import frexp, ldexp
 from numbers import Integral, Real
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from numba import njit
 
-try:
-    from numba import njit, prange
-
-    HAS_NUMBA = True
-except ImportError:  # pragma: no cover - exercised only in minimal installations
-    HAS_NUMBA = False
-
-    def njit(*args, **kwargs):
-        def decorator(func):
-            def wrapper(*wrapper_args, **wrapper_kwargs):
-                raise ImportError("Numba is required to run FORCE.")
-
-            return wrapper
-
-        return decorator
-
-    prange = range
+from ._input import DEFAULT_CHUNK_SIZE, validate_chunk_size, validated_chunks
+from ._moments import PairMoments, status_labels_from_codes
+from ._numeric import normalize_correlation
+from ._quantiles import P2_PROBABILITIES, P2Quantile, P2State, p2_desired_positions
+from ._quantiles import _as_real_array, linear_quantiles, validate_exact_prefix
 
 
-P2_PROBABILITIES = np.array([0.01, 0.25, 0.50, 0.75, 0.99], dtype=np.float64)
+def _p_square_kernel(data, probs):
+    """Compatibility entry point backed by the shared compiled P² transition."""
+    data = _as_real_array(data)
+    if data.ndim != 1 or not np.all(np.isfinite(data)):
+        raise ValueError("P² input must be a finite one-dimensional stream.")
+    if data.size < 5:
+        return linear_quantiles(data, probs)
+    state = P2State(1, probs)
+    state.update_batch(data.reshape(-1, 1))
+    return state.quantiles[:, 0]
 
 
-def p2_desired_positions(n_observations: int, probability: float) -> NDArray[np.float64]:
-    """Return the standard Jain-Chlamtac P² desired marker positions."""
-    if not isinstance(n_observations, Integral) or isinstance(n_observations, bool):
-        raise ValueError("n_observations must be an integer.")
-    if n_observations < 5:
-        raise ValueError("P² marker positions require at least five observations.")
-    if not isinstance(probability, Real) or not np.isfinite(probability):
-        raise ValueError("probability must be finite.")
-    probability = float(probability)
-    if not 0.0 < probability < 1.0:
-        raise ValueError("probability must be strictly between 0 and 1.")
-
-    span = float(n_observations - 1)
-    return np.array(
-        [
-            1.0,
-            1.0 + span * probability / 2.0,
-            1.0 + span * probability,
-            1.0 + span * (1.0 + probability) / 2.0,
-            float(n_observations),
-        ],
-        dtype=np.float64,
-    )
+def _compute_all_quantiles_numba(X, probs, *, exact_prefix=0):
+    state = P2State(X.shape[1], probs, exact_prefix=exact_prefix)
+    for start in range(0, len(X), DEFAULT_CHUNK_SIZE):
+        state.update_batch(X[start : start + DEFAULT_CHUNK_SIZE])
+    return state.quantiles
 
 
-class P2Quantile:
-    """Incremental five-marker P² estimator used for diagnostics and testing."""
-
-    def __init__(self, probability: float):
-        # Reuse public validation and retain only the probability here.
-        p2_desired_positions(5, probability)
-        self.probability = float(probability)
-        self.count = 0
-        self._initial: list[float] = []
-        self._heights: Optional[NDArray[np.float64]] = None
-        self._positions: Optional[NDArray[np.float64]] = None
-        self._desired: Optional[NDArray[np.float64]] = None
-        self._increments = np.array(
-            [
-                0.0,
-                self.probability / 2.0,
-                self.probability,
-                (1.0 + self.probability) / 2.0,
-                1.0,
-            ],
-            dtype=np.float64,
+def _compute_trimmed_corr_numba(X, lower_bounds, upper_bounds):
+    """Compatibility entry point for shared compiled pair-moment updates."""
+    state = PairMoments(X.shape[1])
+    for start in range(0, len(X), DEFAULT_CHUNK_SIZE):
+        state.update_batch(
+            X[start : start + DEFAULT_CHUNK_SIZE], lower_bounds, upper_bounds
         )
-
-    def update(self, value: float) -> "P2Quantile":
-        """Consume one finite observation and return ``self``."""
-        if not isinstance(value, Real) or not np.isfinite(value):
-            raise ValueError("P² observations must be finite real numbers.")
-        value = float(value)
-
-        if self.count < 5:
-            self._initial.append(value)
-            self.count += 1
-            if self.count == 5:
-                self._heights = np.sort(np.asarray(self._initial, dtype=np.float64))
-                self._positions = np.arange(1.0, 6.0, dtype=np.float64)
-                self._desired = p2_desired_positions(5, self.probability)
-            return self
-
-        assert self._heights is not None
-        assert self._positions is not None
-        assert self._desired is not None
-        q = self._heights
-        n = self._positions
-
-        if value < q[0]:
-            q[0] = value
-            cell = 0
-        elif value < q[1]:
-            cell = 0
-        elif value < q[2]:
-            cell = 1
-        elif value < q[3]:
-            cell = 2
-        elif value < q[4]:
-            cell = 3
-        else:
-            q[4] = value
-            cell = 3
-
-        n[cell + 1 :] += 1.0
-        self._desired += self._increments
-        self.count += 1
-
-        for marker in range(1, 4):
-            delta = self._desired[marker] - n[marker]
-            direction = 1.0 if delta >= 1.0 else (-1.0 if delta <= -1.0 else 0.0)
-            if direction == 0.0:
-                continue
-            if direction > 0.0 and n[marker + 1] - n[marker] <= 1.0:
-                continue
-            if direction < 0.0 and n[marker] - n[marker - 1] <= 1.0:
-                continue
-
-            proposed = q[marker] + direction / (n[marker + 1] - n[marker - 1]) * (
-                (n[marker] - n[marker - 1] + direction)
-                * (q[marker + 1] - q[marker])
-                / (n[marker + 1] - n[marker])
-                + (n[marker + 1] - n[marker] - direction)
-                * (q[marker] - q[marker - 1])
-                / (n[marker] - n[marker - 1])
-            )
-            if q[marker - 1] < proposed < q[marker + 1]:
-                q[marker] = proposed
-            else:
-                adjacent = marker + int(direction)
-                q[marker] += direction * (q[adjacent] - q[marker]) / (
-                    n[adjacent] - n[marker]
-                )
-            n[marker] += direction
-
-        return self
-
-    @property
-    def value(self) -> float:
-        """Current estimate, using exact interpolation before initialization."""
-        if self.count == 0:
-            return float("nan")
-        if self.count < 5:
-            return float(np.quantile(np.asarray(self._initial), self.probability))
-        assert self._heights is not None
-        return float(self._heights[2])
-
-    @property
-    def marker_heights(self) -> NDArray[np.float64]:
-        if self._heights is None:
-            return np.sort(np.asarray(self._initial, dtype=np.float64))
-        return self._heights.copy()
-
-    @property
-    def marker_positions(self) -> NDArray[np.float64]:
-        if self._positions is None:
-            return np.arange(1.0, self.count + 1.0, dtype=np.float64)
-        return self._positions.copy()
-
-    @property
-    def desired_positions(self) -> NDArray[np.float64]:
-        if self.count < 5:
-            return np.empty(0, dtype=np.float64)
-        assert self._desired is not None
-        return self._desired.copy()
-
-
-@njit(fastmath=True, cache=True)
-def _p_square_kernel(
-    data: NDArray[np.float64], probs: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    """Estimate multiple quantiles of one finite stream with independent P² states."""
-    n_samples = len(data)
-    n_probs = len(probs)
-    if n_samples < 5:
-        return np.quantile(data, probs)
-
-    q = np.zeros((n_probs, 5), dtype=np.float64)
-    positions = np.zeros((n_probs, 5), dtype=np.float64)
-    desired = np.zeros((n_probs, 5), dtype=np.float64)
-    increments = np.zeros((n_probs, 5), dtype=np.float64)
-    initial = np.sort(data[:5])
-
-    for p_idx in range(n_probs):
-        probability = probs[p_idx]
-        q[p_idx, :] = initial
-        positions[p_idx, :] = np.arange(1.0, 6.0)
-        desired[p_idx, :] = np.array(
-            [
-                1.0,
-                1.0 + 2.0 * probability,
-                1.0 + 4.0 * probability,
-                3.0 + 2.0 * probability,
-                5.0,
-            ]
-        )
-        increments[p_idx, :] = np.array(
-            [
-                0.0,
-                probability / 2.0,
-                probability,
-                (1.0 + probability) / 2.0,
-                1.0,
-            ]
-        )
-
-    for sample_idx in range(5, n_samples):
-        value = data[sample_idx]
-        for p_idx in range(n_probs):
-            if value < q[p_idx, 0]:
-                q[p_idx, 0] = value
-                cell = 0
-            elif value < q[p_idx, 1]:
-                cell = 0
-            elif value < q[p_idx, 2]:
-                cell = 1
-            elif value < q[p_idx, 3]:
-                cell = 2
-            elif value < q[p_idx, 4]:
-                cell = 3
-            else:
-                q[p_idx, 4] = value
-                cell = 3
-
-            for marker in range(cell + 1, 5):
-                positions[p_idx, marker] += 1.0
-            for marker in range(5):
-                desired[p_idx, marker] += increments[p_idx, marker]
-
-            for marker in range(1, 4):
-                delta = desired[p_idx, marker] - positions[p_idx, marker]
-                direction = 1.0 if delta >= 1.0 else (-1.0 if delta <= -1.0 else 0.0)
-                if direction == 0.0:
-                    continue
-                if (
-                    direction > 0.0
-                    and positions[p_idx, marker + 1] - positions[p_idx, marker] <= 1.0
-                ):
-                    continue
-                if (
-                    direction < 0.0
-                    and positions[p_idx, marker] - positions[p_idx, marker - 1] <= 1.0
-                ):
-                    continue
-
-                proposed = q[p_idx, marker] + direction / (
-                    positions[p_idx, marker + 1] - positions[p_idx, marker - 1]
-                ) * (
-                    (
-                        positions[p_idx, marker]
-                        - positions[p_idx, marker - 1]
-                        + direction
-                    )
-                    * (q[p_idx, marker + 1] - q[p_idx, marker])
-                    / (
-                        positions[p_idx, marker + 1]
-                        - positions[p_idx, marker]
-                    )
-                    + (
-                        positions[p_idx, marker + 1]
-                        - positions[p_idx, marker]
-                        - direction
-                    )
-                    * (q[p_idx, marker] - q[p_idx, marker - 1])
-                    / (
-                        positions[p_idx, marker]
-                        - positions[p_idx, marker - 1]
-                    )
-                )
-
-                if q[p_idx, marker - 1] < proposed < q[p_idx, marker + 1]:
-                    q[p_idx, marker] = proposed
-                else:
-                    adjacent = marker + int(direction)
-                    q[p_idx, marker] += direction * (
-                        q[p_idx, adjacent] - q[p_idx, marker]
-                    ) / (
-                        positions[p_idx, adjacent] - positions[p_idx, marker]
-                    )
-                positions[p_idx, marker] += direction
-
-    result = np.empty(n_probs, dtype=np.float64)
-    for p_idx in range(n_probs):
-        result[p_idx] = q[p_idx, 2]
-    return result
-
-
-@njit(parallel=True, cache=True)
-def _compute_all_quantiles_numba(
-    X: NDArray[np.float64], probs: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    n_features = X.shape[1]
-    quantiles = np.empty((len(probs), n_features), dtype=np.float64)
-    for feature in prange(n_features):
-        quantiles[:, feature] = _p_square_kernel(X[:, feature], probs)
-    return quantiles
-
-
-@njit(parallel=True, fastmath=True, cache=True)
-def _compute_trimmed_corr_numba(
-    X: NDArray[np.float64],
-    lower_bounds: NDArray[np.float64],
-    upper_bounds: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Equation 13 using pair-specific accepted-observation means."""
-    n_samples, n_features = X.shape
-    correlation = np.eye(n_features, dtype=np.float64)
-
-    for left in prange(n_features):
-        for right in range(left + 1, n_features):
-            count = 0
-            mean_left = 0.0
-            mean_right = 0.0
-            sum_xx = 0.0
-            sum_yy = 0.0
-            sum_xy = 0.0
-            for sample in range(n_samples):
-                x = X[sample, left]
-                y = X[sample, right]
-                if (
-                    lower_bounds[left] <= x <= upper_bounds[left]
-                    and lower_bounds[right] <= y <= upper_bounds[right]
-                ):
-                    count += 1
-                    delta_left = x - mean_left
-                    delta_right = y - mean_right
-                    mean_left += delta_left / count
-                    mean_right += delta_right / count
-                    sum_xx += delta_left * (x - mean_left)
-                    sum_yy += delta_right * (y - mean_right)
-                    sum_xy += delta_left * (y - mean_right)
-
-            value = 0.0
-            if count > 1:
-                if sum_xx > 0.0 and sum_yy > 0.0:
-                    value = sum_xy / np.sqrt(sum_xx * sum_yy)
-                    value = min(1.0, max(-1.0, value))
-
-            correlation[left, right] = value
-            correlation[right, left] = value
-
-    return correlation
+    return state.correlation()
 
 
 def _as_float_matrix(X: ArrayLike) -> NDArray[np.float64]:
     """Validate estimator input and return a contiguous float64 matrix."""
     try:
-        matrix = np.asarray(X, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
+        matrix = _as_real_array(X)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Input X must be a numeric two-dimensional array.") from exc
     if matrix.ndim != 2:
         raise ValueError("Input X must be a two-dimensional array.")
@@ -368,8 +60,9 @@ def _as_float_matrix(X: ArrayLike) -> NDArray[np.float64]:
         raise ValueError("Input X must have at least 5 samples.")
     if matrix.shape[1] < 2:
         raise ValueError("Input X must have at least 2 features.")
-    if not np.all(np.isfinite(matrix)):
-        raise ValueError("Input X must contain only finite values.")
+    for start in range(0, matrix.shape[0], DEFAULT_CHUNK_SIZE):
+        if not np.all(np.isfinite(matrix[start : start + DEFAULT_CHUNK_SIZE])):
+            raise ValueError("Input X must contain only finite values.")
     return np.ascontiguousarray(matrix)
 
 
@@ -415,168 +108,344 @@ def _validate_force_parameters(
         raise ValueError("epsilon must be greater than zero.")
 
 
-def _covariance_to_correlation(
-    covariance: ArrayLike,
-) -> NDArray[np.float64]:
-    """Normalize a finite covariance matrix with deterministic degeneracy rules."""
-    matrix = np.asarray(covariance, dtype=np.float64)
+@njit(cache=True, nogil=True)
+def _normalize_covariance(matrix):
+    correlation = np.eye(matrix.shape[0], dtype=np.float64)
+    for left in range(matrix.shape[0]):
+        for right in range(left + 1, matrix.shape[0]):
+            value = 0.0
+            if matrix[left, left] > 0 and matrix[right, right] > 0:
+                value = normalize_correlation(
+                    matrix[left, left], matrix[right, right], matrix[left, right]
+                )
+                if not np.isfinite(value) or abs(value) > 1.0 + 1e-12:
+                    raise FloatingPointError(
+                        "Covariance normalization produced an invalid correlation."
+                    )
+                value = min(1.0, max(-1.0, value))
+            correlation[left, right] = correlation[right, left] = value
+    return correlation
+
+
+def _covariance_to_correlation(covariance: ArrayLike) -> NDArray[np.float64]:
+    """Normalize without multiplying variances or silently hiding overflow."""
+    matrix = _as_real_array(covariance)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError("covariance must be a square matrix.")
     if not np.all(np.isfinite(matrix)):
         raise ValueError("covariance must contain only finite values.")
+    # Preserve symmetric entries exactly, including subnormal variances that
+    # would vanish if each operand were halved before summing.
+    matrix = np.where(matrix == matrix.T, matrix, 0.5 * matrix + 0.5 * matrix.T)
+    return _normalize_covariance(matrix)
 
-    matrix = 0.5 * (matrix + matrix.T)
-    variances = np.diag(matrix)
-    positive = variances > 0.0
-    scales = np.ones_like(variances)
-    scales[positive] = np.sqrt(variances[positive])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        correlation = matrix / np.outer(scales, scales)
-    undefined = ~(positive[:, None] & positive[None, :])
-    correlation[undefined] = 0.0
-    correlation[~np.isfinite(correlation)] = 0.0
-    correlation = np.clip(correlation, -1.0, 1.0)
-    np.fill_diagonal(correlation, 1.0)
-    return correlation
+
+def _distance_parts(left, right):
+    """Return abs(left-right) as mantissa/exponent without range overflow."""
+    largest = max(abs(left), abs(right))
+    if largest == 0:
+        return 0.0, 0
+    _, exponent = frexp(largest)
+    mantissa, adjustment = frexp(abs(ldexp(left, -exponent) - ldexp(right, -exponent)))
+    return mantissa, exponent + adjustment
+
+
+def _parts_less(left, right):
+    if left[0] == 0 or right[0] == 0:
+        return left[0] < right[0]
+    return (left[1], left[0]) < (right[1], right[0])
+
+
+def _positive_sum_parts(left, right):
+    exponent = max(left[1], right[1])
+    mantissa, adjustment = frexp(
+        ldexp(left[0], left[1] - exponent) + ldexp(right[0], right[1] - exponent)
+    )
+    return mantissa, exponent + adjustment
+
+
+def _finite_from_parts(mantissa, exponent):
+    try:
+        value = ldexp(mantissa, exponent)
+    except OverflowError as exc:
+        raise FloatingPointError("FORCE bounds exceeded floating-point range.") from exc
+    if not np.isfinite(value):
+        raise FloatingPointError("FORCE bounds exceeded floating-point range.")
+    return value
+
+
+def _finite_positive_product(*values):
+    if any(value == 0 for value in values):
+        return 0.0
+    mantissa, exponent = 1.0, 0
+    for value in values:
+        part, power = frexp(value)
+        mantissa *= part
+        exponent += power
+    return _finite_from_parts(mantissa, exponent)
 
 
 def _compute_bounds_from_quantiles(
-    quantiles: NDArray[np.float64],
-    *,
-    lambda_scale: float,
-    use_ter: bool,
-    ter_max: Optional[float],
-    epsilon: float,
-) -> Tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
-    """Compute Equations 6-11 from q01, q25, q50, q75 and q99."""
-    quantiles = np.asarray(quantiles, dtype=np.float64)
+    quantiles, *, lambda_scale, use_ter, ter_max, epsilon
+):
+    """Equations 6–11; fail explicitly on nonrepresentable bound arithmetic."""
+    quantiles = _as_real_array(quantiles)
     if quantiles.ndim != 2 or quantiles.shape[0] != 5:
         raise ValueError("quantiles must have shape (5, n_features).")
     if not np.all(np.isfinite(quantiles)):
         raise ValueError("quantiles must contain only finite values.")
-
     q01, q25, q50, q75, q99 = quantiles
     location = q50.copy()
-    scale = (q75 - q25) / 1.349
-    negative_scale = scale < 0.0
-    if np.any(negative_scale):
+    scale = np.empty_like(location)
+    ter = np.ones_like(location)
+    lower, upper = np.empty_like(location), np.empty_like(location)
+    crossed = q75 < q25
+    epsilon_parts = frexp(epsilon)
+    degenerate = np.array(
+        [
+            _parts_less(_distance_parts(median, tail), epsilon_parts)
+            for median, tail in zip(q50, q01)
+        ],
+        dtype=bool,
+    )
+    if np.any(crossed):
         warnings.warn(
             "Non-monotone P² quartiles produced a negative IQR; affected scales "
             "were collapsed to zero.",
             RuntimeWarning,
             stacklevel=2,
         )
-        scale = np.maximum(scale, 0.0)
-
-    ter = np.ones_like(location)
-    if use_ter:
-        denominator = np.abs(q50 - q01)
-        degenerate = denominator < epsilon
-        if np.any(degenerate):
-            warnings.warn(
-                "TER denominator is below epsilon for one or more features; "
-                "TER was set to 1 for those features.",
-                RuntimeWarning,
-                stacklevel=2,
+    if use_ter and np.any(degenerate):
+        warnings.warn(
+            "TER denominator is below epsilon for one or more features; "
+            "TER was set to 1 for those features.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    for feature in range(len(location)):
+        iqr, exponent = _distance_parts(q75[feature], q25[feature])
+        scale[feature] = (
+            0.0 if crossed[feature] else _finite_from_parts(iqr / 1.349, exponent)
+        )
+        if use_ter and not degenerate[feature]:
+            numerator = _distance_parts(q99[feature], q50[feature])
+            denominator = _positive_sum_parts(
+                _distance_parts(q50[feature], q01[feature]), epsilon_parts
             )
-        ratio = np.abs(q99 - q50) / (denominator + epsilon)
-        ter = np.maximum(1.0, ratio)
-        ter[degenerate] = 1.0
-        if ter_max is not None:
-            ter = np.minimum(ter, float(ter_max))
-
-    half_width = float(lambda_scale) * ter * scale
-    lower = location - half_width
-    upper = location + half_width
+            mantissa, adjustment = frexp(numerator[0] / denominator[0])
+            ratio = mantissa, numerator[1] - denominator[1] + adjustment
+            if _parts_less(ratio, frexp(1.0)):
+                ter[feature] = 1.0
+            elif ter_max is not None and _parts_less(frexp(float(ter_max)), ratio):
+                ter[feature] = float(ter_max)
+            else:
+                ter[feature] = _finite_from_parts(*ratio)
+        width = _finite_positive_product(
+            float(lambda_scale), ter[feature], scale[feature]
+        )
+        with np.errstate(over="raise", invalid="raise"):
+            lower[feature] = location[feature] - width
+            upper[feature] = location[feature] + width
     return location, scale, ter, lower, upper
 
 
+def _bound_status(quantiles, use_ter, epsilon):
+    """Separate diagnostic flags: no reordering of independent quantiles."""
+    return {
+        "quantile_crossings": quantiles[1:] < quantiles[:-1],
+        "any_quantile_crossing": np.any(quantiles[1:] < quantiles[:-1], axis=0),
+        "crossed_quartiles": quantiles[3] < quantiles[1],
+        "zero_iqr": quantiles[3] == quantiles[1],
+        "degenerate_lower_tail": (
+            np.array(
+                [
+                    _parts_less(_distance_parts(m, q), frexp(epsilon))
+                    for m, q in zip(quantiles[2], quantiles[0])
+                ],
+                dtype=bool,
+            )
+            if use_ter
+            else np.zeros(quantiles.shape[1], dtype=bool)
+        ),
+    }
+
+
 class ForceEstimator:
-    """Fast Outlier-Robust Correlation Estimator from Algorithm 1."""
+    """Final-bound FORCE, using an array or two identical source traversals.
+
+    ``fit`` returns a correlation matrix. ``fit_replayable`` has the same
+    mathematical target and uses O(p² + (chunk_size + exact_prefix)*p)
+    auxiliary memory, excluding source-owned storage.
+
+    Array ``fit`` uses exact linear quantiles only when N < ``exact_cutover``;
+    otherwise it uses P². This small-batch fallback is separate from the optional
+    ``exact_prefix`` readout policy: exact quantiles through N <= exact_prefix,
+    then standard P², which has processed every prefix row in the background.
+    The paper does not define the handoff; no exact-marker reseeding is assumed.
+    The switch may be discontinuous; later estimates equal pure P². Enable only
+    one optional mode at a time. Defaults select the paper's experimental pure-P²
+    mode. Repeated prefix readouts in the scalar API repeat exact computation.
+    """
 
     def __init__(
         self,
-        lambda_scale: float = 3.0,
-        exact_cutover: int = 5,
-        use_ter: bool = True,
-        ter_max: Optional[float] = None,
-        epsilon: float = 1e-10,
+        lambda_scale=3.0,
+        exact_cutover=5,
+        use_ter=True,
+        ter_max=None,
+        epsilon=1e-10,
+        *,
+        exact_prefix=0,
     ):
-        if not HAS_NUMBA:
-            raise ImportError("ForceEstimator requires Numba.")
         _validate_force_parameters(
             lambda_scale, exact_cutover, use_ter, ter_max, epsilon
         )
+        exact_prefix = validate_exact_prefix(exact_prefix)
+        if exact_prefix and exact_cutover != 5:
+            raise ValueError("exact_prefix requires exact_cutover=5.")
         self.lambda_scale = float(lambda_scale)
         self.exact_cutover = int(exact_cutover)
+        self.exact_prefix = exact_prefix
         self.use_ter = bool(use_ter)
         self.ter_max = None if ter_max is None else float(ter_max)
         self.epsilon = float(epsilon)
         self.probs = P2_PROBABILITIES.copy()
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.quantiles: Optional[NDArray[np.float64]] = None
-        self.thresholds: Optional[
-            Tuple[NDArray[np.float64], NDArray[np.float64]]
-        ] = None
-        self.location_: Optional[NDArray[np.float64]] = None
-        self.scale_: Optional[NDArray[np.float64]] = None
-        self.ter_: Optional[NDArray[np.float64]] = None
+        self.quantiles = self.thresholds = None
+        self.location_ = self.scale_ = self.ter_ = None
+        self.accepted_counts_ = self._pair_status_codes = None
+        self.bound_status_ = None
+        self.n_samples_ = self.n_features_in_ = None
+        self.execution_mode_ = None
 
-    def fit(self, X: ArrayLike) -> NDArray[np.float64]:
-        """Estimate the pairwise trimmed correlation matrix."""
-        matrix = _as_float_matrix(X)
-        self.quantiles = self._compute_quantiles(matrix)
-        (
-            self.location_,
-            self.scale_,
-            self.ter_,
-            lower,
-            upper,
-        ) = _compute_bounds_from_quantiles(
-            self.quantiles,
-            lambda_scale=self.lambda_scale,
-            use_ter=self.use_ter,
-            ter_max=self.ter_max,
-            epsilon=self.epsilon,
-        )
-        self.thresholds = (lower, upper)
-        return _compute_trimmed_corr_numba(matrix, lower, upper)
-
-    def _compute_quantiles(
-        self, X: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
-        if X.shape[0] < self.exact_cutover:
-            return np.quantile(X, self.probs, axis=0, method="linear")
-        return _compute_all_quantiles_numba(X, self.probs)
-
-    def _calculate_adaptive_thresholds(
-        self, quantiles: NDArray[np.float64]
-    ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Compatibility helper returning only lower and upper bounds."""
-        _, _, _, lower, upper = _compute_bounds_from_quantiles(
+    def _bounds(self, quantiles):
+        return _compute_bounds_from_quantiles(
             quantiles,
             lambda_scale=self.lambda_scale,
             use_ter=self.use_ter,
             ter_max=self.ter_max,
             epsilon=self.epsilon,
         )
-        return lower, upper
+
+    def _publish(self, quantiles, bounds, moments, n_samples, mode):
+        correlation = moments.correlation()
+        counts, codes = moments.accepted_counts(), moments.status_codes()
+        self.quantiles = quantiles
+        self.location_, self.scale_, self.ter_, lower, upper = bounds
+        self.thresholds = (lower, upper)
+        self.accepted_counts_, self._pair_status_codes = counts, codes
+        self.bound_status_ = _bound_status(quantiles, self.use_ter, self.epsilon)
+        self.n_samples_, self.n_features_in_ = n_samples, quantiles.shape[1]
+        self.execution_mode_ = mode
+        return correlation
+
+    def fit(self, X: ArrayLike) -> NDArray[np.float64]:
+        """Fit final-bound Eq. 13; array conversion may require O(Np) memory."""
+        matrix = _as_float_matrix(X)
+        quantiles = self._compute_quantiles(matrix)
+        bounds = self._bounds(quantiles)
+        moments = PairMoments(matrix.shape[1])
+        for start in range(0, len(matrix), DEFAULT_CHUNK_SIZE):
+            moments.update_batch(
+                matrix[start : start + DEFAULT_CHUNK_SIZE], *bounds[3:]
+            )
+        return self._publish(quantiles, bounds, moments, len(matrix), "batch")
+
+    def fit_replayable(self, source_factory, chunk_size=DEFAULT_CHUNK_SIZE):
+        """Fit using two fresh traversals of the same finite ordered source.
+
+        The factory returns an iterable yielding rows or 2-D blocks. Conversion,
+        validation and hashing are bounded by ``chunk_size``. The small-batch
+        fallback is unavailable (``exact_cutover=5`` is required); the optional
+        ``exact_prefix`` readout needs an additional O(exact_prefix*p) buffer,
+        released after the prefix. A checksum of float64 values plus shape
+        detects changed rows, order, or length; chunk boundaries may differ.
+        Source-owned storage and source buffering are outside this memory bound.
+        Failed fits leave previously published diagnostics unchanged.
+        """
+        chunk_size = validate_chunk_size(chunk_size)
+        if self.exact_cutover != 5:
+            raise ValueError("fit_replayable requires exact_cutover=5.")
+        if not callable(source_factory):
+            raise ValueError(
+                "source_factory must return a fresh iterable on each call."
+            )
+        try:
+            first = iter(source_factory())
+        except TypeError as exc:
+            raise ValueError("source_factory must return an iterable.") from exc
+        state = None
+        first_digest = hashlib.sha256()
+        for chunk in validated_chunks(first, chunk_size):
+            if state is None:
+                state = P2State(
+                    chunk.shape[1], self.probs, exact_prefix=self.exact_prefix
+                )
+            state.update_batch(chunk)
+            first_digest.update(memoryview(chunk).cast("B"))
+        if state is None or state.count < 5:
+            raise ValueError("Input source must have at least 5 samples.")
+        quantiles = state.quantiles
+        bounds = self._bounds(quantiles)
+        try:
+            second = iter(source_factory())
+        except TypeError as exc:
+            raise ValueError("source_factory must return an iterable.") from exc
+        if second is first:
+            raise ValueError("source_factory returned a reused one-shot iterator.")
+        moments = PairMoments(quantiles.shape[1])
+        second_digest = hashlib.sha256()
+        n_samples = 0
+        for chunk in validated_chunks(second, chunk_size):
+            if chunk.shape[1] != quantiles.shape[1]:
+                raise ValueError("Replay feature count changed between traversals.")
+            moments.update_batch(chunk, *bounds[3:])
+            n_samples += len(chunk)
+            second_digest.update(memoryview(chunk).cast("B"))
+        if n_samples != state.count or first_digest.digest() != second_digest.digest():
+            raise ValueError("Replay content, row order, or sample count changed.")
+        return self._publish(quantiles, bounds, moments, n_samples, "replay")
+
+    def _compute_quantiles(self, X):
+        if X.shape[0] < self.exact_cutover:
+            return linear_quantiles(X, self.probs, axis=0)
+        return _compute_all_quantiles_numba(
+            X, self.probs, exact_prefix=self.exact_prefix
+        )
+
+    def _calculate_adaptive_thresholds(self, quantiles):
+        """Compatibility helper returning only lower and upper bounds."""
+        return self._bounds(quantiles)[3:]
 
     @property
-    def state_nbytes_(self) -> int:
-        """Bytes retained by fitted estimator diagnostics, excluding input/output."""
+    def pair_status_codes_(self):
+        """Compact int8 status snapshot: 0 ok, 1 insufficient, 2 zero variance."""
+        return (
+            None if self._pair_status_codes is None else self._pair_status_codes.copy()
+        )
+
+    @property
+    def pair_status_(self):
+        """Expanded labels, allocated only when requested."""
+        return (
+            None
+            if self._pair_status_codes is None
+            else status_labels_from_codes(self._pair_status_codes)
+        )
+
+    @property
+    def state_nbytes_(self):
+        """Retained NumPy diagnostics, excluding input, output and fit workspace."""
         arrays = [
+            self.probs,
             self.quantiles,
             self.location_,
             self.scale_,
             self.ter_,
+            self.accepted_counts_,
+            self._pair_status_codes,
         ]
         if self.thresholds is not None:
             arrays.extend(self.thresholds)
-        return int(sum(array.nbytes for array in arrays if array is not None))
+        if self.bound_status_ is not None:
+            arrays.extend(self.bound_status_.values())
+        return int(sum(a.nbytes for a in arrays if a is not None))

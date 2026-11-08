@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from ._evaluation import estimator_pair_validity
 from .core import ForceEstimator
 from .data import (
     ExternalDataUnavailable,
@@ -39,6 +40,15 @@ DATASET_NAMES = (
     "genomics",
 )
 
+GENOMICS_REFERENCE_POLICY = {
+    "reference": "spearman",
+    "reference_basis": "paper_section_3.2.3",
+    "reference_interpretation": (
+        "The dataset-specific Spearman reference in Section 3.2.3 takes "
+        "precedence over the generic FastMCD reference in Section 2.4.3."
+    ),
+}
+
 
 class DatasetNotReproducible(RuntimeError):
     """Raised when the paper omits identifiers needed to construct a dataset."""
@@ -46,10 +56,18 @@ class DatasetNotReproducible(RuntimeError):
 
 @dataclass(frozen=True)
 class PreparedDataset:
+    """Reference validity accompanies empirical compatibility outputs.
+
+    A missing mask explicitly declares finite supplied reference coefficients
+    valid. Estimated references with zero-filled undefined pairs carry a mask.
+    """
+
     name: str
     X: NDArray[np.float64]
     reference: NDArray[np.float64]
     provenance: Dict[str, Any]
+    reference_valid: Optional[NDArray[np.bool_]] = None
+    reference_validity_basis: str = "finite_reference_declaration"
 
 
 @dataclass(frozen=True)
@@ -79,6 +97,7 @@ PAPER_PROTOCOL = Protocol(
     force_parameters={
         "lambda_scale": 3.0,
         "exact_cutover": 5,
+        "exact_prefix": 0,
         "use_ter": True,
         "ter_max": None,
         "epsilon": 1e-10,
@@ -126,15 +145,17 @@ def build_estimators(protocol: str) -> Dict[str, CorrelationEstimator]:
     if protocol == "paper":
         force: CorrelationEstimator = ForceEstimator(**PAPER_PROTOCOL.force_parameters)
         ter_max = None
+        winsor_quantile_method = "linear"
     elif protocol == "legacy":
         force = LegacyForceEstimator()
         ter_max = 3.0
+        winsor_quantile_method = "tail_count"
     else:
         raise ValueError("protocol must be 'paper' or 'legacy'.")
     return {
         "Pearson": PearsonEstimator(),
         "Spearman": SpearmanEstimator(),
-        "Winsorized": WinsorizedEstimator(),
+        "Winsorized": WinsorizedEstimator(quantile_method=winsor_quantile_method),
         "FastMCD": FastMCDEstimator(random_state=42),
         "TP-Exact": TrimmedPearsonExact(use_ter=False),
         "TP-TER": TrimmedPearsonExact(use_ter=True, ter_max=ter_max),
@@ -157,14 +178,10 @@ def _spearman_reference(X: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.asarray(np.corrcoef(ranks, rowvar=False), dtype=np.float64)
 
 
-def _smoke_fixture(
-    dataset: str, seed: int
-) -> PreparedDataset:
+def _smoke_fixture(dataset: str, seed: int) -> PreparedDataset:
     if dataset.startswith("odds-"):
         odds_name = dataset.removeprefix("odds-")
-        X, reference = generate_odds_surrogate(
-            odds_name, n_max_samples=160, seed=seed
-        )
+        X, reference = generate_odds_surrogate(odds_name, n_max_samples=160, seed=seed)
         if X.shape[1] > 8:
             X = X[:, :8]
             reference = reference[:8, :8]
@@ -194,6 +211,7 @@ def _smoke_fixture(
             "source": "deterministic_smoke_fixture",
             "seed": seed,
             "not_for_paper_metrics": True,
+            **(GENOMICS_REFERENCE_POLICY if dataset == "genomics" else {}),
         },
     )
 
@@ -272,7 +290,7 @@ def prepare_dataset(
                 seed=seed,
                 cache_dir=data_dir,
                 offline=offline,
-                reference="fastmcd",
+                reference="spearman",
                 return_metadata=True,
             )
             if X.shape != (5000, 100):
@@ -283,7 +301,7 @@ def prepare_dataset(
                 dataset,
                 X,
                 reference,
-                metadata,
+                {**metadata, **GENOMICS_REFERENCE_POLICY},
             )
         odds_name = dataset.removeprefix("odds-")
         X, labels, metadata = load_odds_dataset(
@@ -291,17 +309,27 @@ def prepare_dataset(
         )
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
-            reference = FastMCDEstimator(random_state=42).fit(X)
+            reference_estimator = FastMCDEstimator(random_state=42)
+            reference = reference_estimator.fit(X)
+        reference_valid, reference_validity_basis = estimator_pair_validity(
+            reference_estimator, reference
+        )
         metadata = {
             **metadata,
             "reference": "FastMCD",
             "contamination": float(labels.mean()),
             "reference_warning_count": len(captured),
-            "reference_warning": (
-                str(captured[0].message) if captured else ""
-            ),
+            "reference_warning": (str(captured[0].message) if captured else ""),
+            "reference_validity_basis": reference_validity_basis,
         }
-        return PreparedDataset(dataset, X, reference, metadata)
+        return PreparedDataset(
+            dataset,
+            X,
+            reference,
+            metadata,
+            reference_valid=reference_valid,
+            reference_validity_basis=reference_validity_basis,
+        )
 
     if dataset == "sp500":
         X, reference, metadata = fetch_sp500_data(

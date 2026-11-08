@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use FORCE in your research, please cite the paper below."
+title: "FORCE: Fast Outlier-Robust Correlation Estimation"
+authors:
+  - family-names: Jang
+    given-names: Sooyoung
+repository-code: "https://github.com/pz1004/force"
+license: MIT
+preferred-citation:
+  type: article
+  title: "FORCE: Fast Outlier-Robust Correlation Estimation via Streaming Quantile Approximation for High-Dimensional Data Streams"
+  authors:
+    - family-names: Jang
+      given-names: Sooyoung
+    - family-names: Choi
+      given-names: Changbeom
+  journal: Mathematics
+  volume: 14
+  issue: 1
+  start: 191
+  year: 2026
+  doi: "10.3390/math14010191"

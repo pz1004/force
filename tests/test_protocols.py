@@ -89,6 +89,77 @@ def test_every_dataset_has_a_deterministic_smoke_path(dataset: str) -> None:
     assert first.reference.shape == (first.X.shape[1], first.X.shape[1])
 
 
+def test_genomics_smoke_reference_is_spearman():
+    from force import SpearmanEstimator
+
+    prepared = prepare_dataset(
+        "genomics",
+        protocol="paper",
+        seed=42,
+        smoke=True,
+        offline=True,
+        data_dir=None,
+    )
+    np.testing.assert_allclose(
+        prepared.reference, SpearmanEstimator().fit(prepared.X), atol=1e-14
+    )
+    assert prepared.provenance["reference"] == "spearman"
+    assert prepared.provenance["reference_basis"] == "paper_section_3.2.3"
+
+
+def test_full_genomics_uses_dataset_specific_paper_reference(monkeypatch):
+    def fetch(*, reference, **kwargs):
+        assert reference == "spearman"
+        return np.zeros((5000, 100)), np.eye(100), {"reference": reference}
+
+    monkeypatch.setattr("force.protocols.fetch_genomics_data", fetch)
+    prepared = prepare_dataset(
+        "genomics",
+        protocol="paper",
+        seed=42,
+        smoke=False,
+        offline=True,
+        data_dir=None,
+        gemma_dataset="supplied-accession",
+    )
+    assert prepared.provenance["reference"] == "spearman"
+    assert prepared.provenance["reference_basis"] == "paper_section_3.2.3"
+    assert "Section 2.4.3" in prepared.provenance["reference_interpretation"]
+
+
+def test_odds_reference_retains_invalid_pair_metadata(monkeypatch):
+    X = np.arange(90, dtype=float).reshape(30, 3)
+    codes = np.zeros((3, 3), dtype=np.int8)
+    codes[0, 1] = codes[1, 0] = 2
+
+    class ReferenceEstimator:
+        def __init__(self, *, random_state):
+            assert random_state == 42
+
+        def fit(self, values):
+            np.testing.assert_array_equal(values, X)
+            self.pair_status_codes_ = codes.copy()
+            return np.eye(3)
+
+    monkeypatch.setattr("force.protocols.FastMCDEstimator", ReferenceEstimator)
+    monkeypatch.setattr(
+        "force.protocols.load_odds_dataset",
+        lambda *args, **kwargs: (X, np.zeros(len(X)), {"source": "fixture"}),
+    )
+    prepared = prepare_dataset(
+        "odds-mammography",
+        protocol="paper",
+        seed=42,
+        smoke=False,
+        offline=True,
+        data_dir=None,
+    )
+    assert prepared.reference[0, 1] == 0
+    np.testing.assert_array_equal(prepared.reference_valid, codes == 0)
+    assert prepared.reference_validity_basis == "pair_status_codes"
+    assert prepared.provenance["reference_validity_basis"] == "pair_status_codes"
+
+
 def test_verified_odds_metadata() -> None:
     assert ODDS_DATASETS["mammography"]["shape"] == (11183, 6)
     assert ODDS_DATASETS["satellite"]["shape"] == (6435, 36)
@@ -105,9 +176,7 @@ def test_external_data_failure_is_not_replaced_with_synthetic_data(
 
     monkeypatch.setattr("force.data.urllib.request.urlopen", fail_download)
     with pytest.raises(ExternalDataUnavailable, match="Could not download"):
-        load_odds_dataset(
-            "mammography", cache_dir=tmp_path, offline=False
-        )
+        load_odds_dataset("mammography", cache_dir=tmp_path, offline=False)
     assert not (tmp_path / "odds" / "mammography.mat").exists()
 
 
@@ -212,11 +281,7 @@ def test_gemma_cached_manifest_and_checksum_are_required(
     tmp_path: Path, manifest_mode: str
 ) -> None:
     dataset_id = "TEST-GEMMA"
-    path = (
-        tmp_path
-        / "gemma"
-        / f"{dataset_id}-processed-unfiltered.tsv"
-    )
+    path = tmp_path / "gemma" / f"{dataset_id}-processed-unfiltered.tsv"
     path.parent.mkdir(parents=True)
     path.write_text("Probe\tSample-1\np1\t1.0\n", encoding="utf-8")
     if manifest_mode != "missing":
@@ -234,18 +299,14 @@ def test_gemma_cached_manifest_and_checksum_are_required(
             manifest.pop("retrieved_at")
         else:
             manifest["processed_sha256"] = "f" * 64
-        path.with_suffix(".json").write_text(
-            json.dumps(manifest), encoding="utf-8"
-        )
+        path.with_suffix(".json").write_text(json.dumps(manifest), encoding="utf-8")
     message = {
         "missing": "provenance manifest",
         "schema": "missing required fields",
         "checksum": "checksum mismatch",
     }[manifest_mode]
     with pytest.raises(ExternalDataUnavailable, match=message):
-        _download_gemma_processed(
-            dataset_id, cache_dir=tmp_path, offline=True
-        )
+        _download_gemma_processed(dataset_id, cache_dir=tmp_path, offline=True)
 
 
 def test_legacy_synthetic_reproduces_published_table() -> None:
@@ -272,6 +333,22 @@ def test_legacy_synthetic_reproduces_published_table() -> None:
         assert _rmse(estimator.fit(prepared.X), prepared.reference) == pytest.approx(
             expected[name], abs=5e-5
         )
+
+
+@pytest.mark.parametrize(
+    "protocol,method", [("paper", "linear"), ("legacy", "tail_count")]
+)
+def test_winsorization_convention_is_explicit_in_protocol_and_provenance(
+    protocol, method
+):
+    from force.protocols import build_estimators
+    from force.reporting import estimator_parameters
+
+    estimator = build_estimators(protocol)["Winsorized"]
+    assert estimator.quantile_method == method
+    parameters = estimator_parameters(estimator)
+    assert parameters["quantile_method"] == method
+    assert parameters["limits"] == [0.05, 0.05]
 
 
 def test_benchmark_machine_readable_schema(tmp_path: Path) -> None:
@@ -307,7 +384,11 @@ def test_benchmark_machine_readable_schema(tmp_path: Path) -> None:
     report_text = (output / "report.json").read_text()
     assert "NaN" not in report_text
     assert "Infinity" not in report_text
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
+    assert report["estimate_status"] == "complete"
+    assert all(row["estimate_status"] == "complete" for row in report["results"])
+    assert all(row["coverage"] == 1.0 for row in report["results"])
+    assert all(row["timing_status"] == "warmed" for row in report["results"])
     assert report["status"] == "completed"
     assert report["protocol"]["name"] == "paper"
     assert report["datasets"][0]["status"] == "completed"
@@ -330,11 +411,44 @@ def test_benchmark_machine_readable_schema(tmp_path: Path) -> None:
     assert summary["runs"] == 1
     assert summary["std_time_ms"] is None
     assert summary["ci95_time_ms"] is None
+    assert summary["ci95_rmse"] is None
+    assert summary["replicate_kind"] == "independent_order"
     assert (output / "results_raw.csv").exists()
     raw = pd.read_csv(output / "results_raw.csv")
     assert {"seed", "status", "estimator_parameters"} <= set(raw.columns)
     assert set(raw["seed"]) == {42}
+    assert raw["data_sha256"].nunique() == raw["reference_sha256"].nunique() == 1
+    assert raw["comparison_target"].eq("known_clean_population_Pearson").all()
     assert (output / "summary.md").exists()
+
+
+def test_actual_fixed_dataset_runner_reports_repeatability_not_rmse_uncertainty():
+    from scripts.run_benchmark import run_dataset, _summary_records
+
+    X = np.random.default_rng(24).normal(size=(80, 2))
+    rows = run_dataset(
+        dataset_name="fixture",
+        X=X,
+        reference=np.eye(2),
+        protocol="paper",
+        runs=3,
+        seed=24,
+    )
+    frame = pd.DataFrame(rows)
+    assert frame["status"].eq("completed").all()
+    assert frame["replicate_kind"].eq("fixed_dataset_timing").all()
+    assert frame["data_sha256"].nunique() == frame["reference_sha256"].nunique() == 1
+    assert frame["comparison_target"].eq("supplied_reference_matrix").all()
+    force = frame[frame["algorithm"] == "FORCE"]
+    assert force["rmse"].nunique() == 1
+    summaries = _summary_records(frame)
+    assert len(summaries) == 7
+    for summary in summaries:
+        assert summary["runs"] == 3
+        assert summary["ci95_rmse"] is None
+        assert summary["rmse_interpretation"] == "conditional_fixed_dataset_error"
+        assert summary["rmse_repeatability_std"] == summary["std_rmse"]
+        assert np.isfinite(summary["ci95_time_ms"])
 
 
 def test_paper_data_blockers_set_aggregate_status(
@@ -368,9 +482,7 @@ def test_paper_data_blockers_set_aggregate_status(
     assert completed.returncode == 0, completed.stderr
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "not_reproducible"
-    assert {
-        record["status"] for record in report["datasets"]
-    } == {"not_reproducible"}
+    assert {record["status"] for record in report["datasets"]} == {"not_reproducible"}
     assert not report["results"]
 
 

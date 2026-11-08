@@ -23,6 +23,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from force import P2Quantile
+from force.diagnostics import quantile_rank_interval_error, reference_quantiles
 from force.legacy import _legacy_p_square_kernel
 from force.protocols import get_protocol
 from force.reporting import command_line, environment_metadata, write_json
@@ -50,19 +51,45 @@ def run_diagnostic(
     repetitions: int,
     protocol: str,
 ) -> List[dict]:
+    probabilities = tuple(float(probability) for probability in probabilities)
+    if not probabilities or any(
+        not np.isfinite(probability) or not 0 < probability < 1
+        for probability in probabilities
+    ):
+        raise ValueError(
+            "P² probabilities must be finite and strictly between 0 and 1."
+        )
+    if repetitions < 1:
+        raise ValueError("repetitions must be positive.")
+    if protocol not in {"paper", "legacy"}:
+        raise ValueError("protocol must be 'paper' or 'legacy'.")
     rows: List[dict] = []
     for n_samples in sample_sizes:
+        if n_samples < 1:
+            raise ValueError("Sample sizes must be positive.")
         errors = {probability: [] for probability in probabilities}
         rank_errors = {probability: [] for probability in probabilities}
         for _ in range(repetitions):
             values = np.asarray(sampler(n_samples), dtype=np.float64)
-            for probability in probabilities:
-                exact = float(np.quantile(values, probability))
+            if values.shape != (n_samples,) or not np.isfinite(values).all():
+                raise ValueError(
+                    "sampler must return the requested finite one-dimensional sample."
+                )
+            exact = reference_quantiles(values[:, None], probabilities)[:, 0]
+            for probability, reference in zip(probabilities, exact):
                 estimate = _estimate(values, probability, protocol)
-                errors[probability].append(abs(estimate - exact))
-                empirical_rank = float(np.mean(values <= estimate))
+                absolute_error = abs(estimate - float(reference))
+                if not np.isfinite(estimate) or not np.isfinite(absolute_error):
+                    raise FloatingPointError(
+                        "Quantile estimate or absolute error exceeds the supported finite range."
+                    )
+                errors[probability].append(absolute_error)
                 rank_errors[probability].append(
-                    abs(empirical_rank - probability)
+                    float(
+                        quantile_rank_interval_error(
+                            values[:, None], np.array([[estimate]]), [probability]
+                        )[0, 0]
+                    )
                 )
         for probability in probabilities:
             rows.append(
@@ -73,15 +100,19 @@ def run_diagnostic(
                     "n_samples": n_samples,
                     "probability": probability,
                     "repetitions": repetitions,
-                    "mean_absolute_error": float(
-                        np.mean(errors[probability])
-                    ),
-                    "mean_rank_error": float(
-                        np.mean(rank_errors[probability])
-                    ),
+                    "mean_absolute_error": _nonnegative_mean(errors[probability]),
+                    "mean_rank_error": float(np.mean(rank_errors[probability])),
+                    "rank_error_definition": "distance_to_empirical_rank_interval",
+                    "exact_quantile_method": "linear_decimal_reference",
                 }
             )
     return rows
+
+
+def _nonnegative_mean(values: List[float]) -> float:
+    """Average finite nonnegative errors without overflowing their sum."""
+    scale = max(values)
+    return float(np.mean(np.asarray(values) / scale) * scale) if scale else 0.0
 
 
 def main() -> int:
@@ -108,9 +139,7 @@ def main() -> int:
         help="Deprecated direct JSON path; prefer --output-dir.",
     )
     args = parser.parse_args()
-    requested_runs = (
-        args.repetitions if args.repetitions is not None else args.runs
-    )
+    requested_runs = args.repetitions if args.repetitions is not None else args.runs
     if requested_runs < 1:
         parser.error("--runs must be at least 1")
     repetitions = 2 if args.smoke else requested_runs
@@ -140,18 +169,14 @@ def main() -> int:
     )
     for row in rows:
         row["seed"] = args.seed
-    output_dir = (
-        Path(args.output).parent if args.output else Path(args.output_dir)
-    )
-    report_path = (
-        Path(args.output) if args.output else output_dir / "report.json"
-    )
+    output_dir = Path(args.output).parent if args.output else Path(args.output_dir)
+    report_path = Path(args.output) if args.output else output_dir / "report.json"
     output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_dir / "results.csv", index=False)
     write_json(
         report_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "completed",
             "protocol": get_protocol(args.protocol).as_dict(),
             "smoke": bool(args.smoke),

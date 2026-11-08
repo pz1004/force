@@ -24,6 +24,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from force.data import ExternalDataUnavailable
+from force._evaluation import correlation_score, estimator_pair_validity
 from force.protocols import (
     DatasetNotReproducible,
     build_estimator,
@@ -39,17 +40,10 @@ from force.reporting import (
 )
 
 
-def reference_corr_low_vol(
-    returns: np.ndarray, cutoff_fraction: float
-) -> np.ndarray:
+def reference_corr_low_vol(returns: np.ndarray, cutoff_fraction: float) -> np.ndarray:
     volatility = np.mean(np.abs(returns), axis=1)
     threshold = np.quantile(volatility, 1.0 - cutoff_fraction)
     return np.corrcoef(returns[volatility <= threshold], rowvar=False)
-
-
-def rmse_offdiag(left: np.ndarray, right: np.ndarray) -> float:
-    mask = np.triu(np.ones_like(left, dtype=bool), k=1)
-    return float(np.sqrt(np.mean((left[mask] - right[mask]) ** 2)))
 
 
 def _tickers(path: str | None) -> Sequence[str] | None:
@@ -66,11 +60,7 @@ def _tickers(path: str | None) -> Sequence[str] | None:
         values = payload
     else:
         values = text.replace(",", "\n").splitlines()
-    return tuple(
-        str(value).strip().upper()
-        for value in values
-        if str(value).strip()
-    )
+    return tuple(str(value).strip().upper() for value in values if str(value).strip())
 
 
 def main() -> int:
@@ -126,6 +116,13 @@ def main() -> int:
                 for run_id in range(1, runs + 1):
                     estimator = build_estimator(args.protocol, name)
                     estimate = estimator.fit(prepared.X)
+                    valid, validity_basis = estimator_pair_validity(estimator, estimate)
+                    score = correlation_score(
+                        estimate,
+                        reference,
+                        estimate_valid=valid,
+                        require_complete=True,
+                    )
                     rows.append(
                         {
                             "protocol": args.protocol,
@@ -134,7 +131,10 @@ def main() -> int:
                             "algorithm": name,
                             "run_id": run_id,
                             "seed": args.seed,
-                            "rmse": rmse_offdiag(estimate, reference),
+                            "rmse": score["rmse"],
+                            "score": score,
+                            "estimate_status": score["status"],
+                            "validity_basis": validity_basis,
                         }
                     )
         report["results"] = rows

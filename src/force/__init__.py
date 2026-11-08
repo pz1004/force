@@ -7,6 +7,7 @@ tools for benchmarking and analysis.
 """
 from .trimmed_pearson import TrimmedPearsonExact
 from .core import ForceEstimator, P2Quantile, p2_desired_positions
+from .streaming import StreamingForceEstimator
 from .legacy import LegacyForceEstimator
 from .estimators import (
     CorrelationEstimator,
@@ -33,6 +34,7 @@ __version__ = "1.1.0"
 __all__ = [
     # Core
     "ForceEstimator",
+    "StreamingForceEstimator",
     "P2Quantile",
     "p2_desired_positions",
     "LegacyForceEstimator",

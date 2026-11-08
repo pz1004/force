@@ -10,7 +10,7 @@ Compatible input formats:
 
 Figures:
 1. Execution time comparison (log scale grouped bar chart)
-2. Estimator landscape (speed-robustness plane)
+2. Measured runtime versus reference RMSE, separately for each dataset
 3. RMSE comparison (grouped bar chart)
 4. FORCE speedup heatmap (bonus)
 5. Combined performance (bonus)
@@ -21,6 +21,9 @@ Author: Sooyoung Jang (revised to support TrimmedPearson baselines and new pipel
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -60,6 +63,8 @@ COLORS = {
     'FastMCD': '#d62728',                   # Red
     'TrimmedPearsonExact(no TER)': '#8c564b',# Brown
     'TrimmedPearsonExact(TER)': '#e377c2',   # Pink
+    'TP-Exact': '#8c564b',
+    'TP-TER': '#e377c2',
     'FORCE': '#9467bd',                     # Purple
 }
 
@@ -105,59 +110,138 @@ PREFERRED_DATASET_ORDER = [
 # -------------------------
 # Utilities
 # -------------------------
+IDENTITY_COLUMNS = [
+    'protocol', 'mode', 'execution_schedule', 'estimator', 'estimator_parameters',
+    'bound_policy', 'policy_parameters', 'comparison_target', 'clean_reference_target',
+    'target', 'target_definition', 'quantile_backend', 'n_samples', 'n_features',
+    'replicate_kind', 'rmse_interpretation', 'identity_status',
+]
+COMPARISON_COLUMNS = [
+    'comparison_target', 'clean_reference_target', 'target', 'target_definition',
+    'n_samples', 'n_features', 'replicate_kind',
+]
+DATA_IDENTITY_COLUMNS = [
+    'data_sha256', 'reference_sha256', 'data_identity', 'data_id', 'dataset_id',
+    'dataset_sha256', 'source_sha256', 'reference_id',
+    'base_data_sha256', 'order_sha256', 'order_seed',
+    'eligible_mask_sha256', 'comparison_mask_sha256',
+    'eligible_pair_count', 'compared_pair_count',
+]
+INDEPENDENT_REPLICATES = {'independent_data', 'independent_order'}
+REQUIRED_IDENTITY = ['protocol', 'comparison_target', 'n_samples', 'n_features',
+                     'data_sha256', 'reference_sha256']
+
+
+def _validate_identity(frame: pd.DataFrame) -> None:
+    # A method name cannot silently denote different protocols or modes.
+    for name in ('protocol', 'mode'):
+        if name in frame and frame[name].nunique(dropna=False) != 1:
+            raise ValueError(f"Mixed {name} values; generate separate figures for each identity.")
+    for _, group in frame.groupby(['dataset', 'method'], dropna=False):
+        for name in IDENTITY_COLUMNS:
+            if name in group and group[name].nunique(dropna=False) != 1:
+                raise ValueError(f"Mixed {name} values within a dataset/method; split the input.")
+    for _, group in frame.groupby('dataset', dropna=False):
+        for name in COMPARISON_COLUMNS:
+            if name in group and group[name].nunique(dropna=False) != 1:
+                raise ValueError(f"Mixed {name} values across methods for one dataset.")
+        kind = group['replicate_kind'].iloc[0] if 'replicate_kind' in group else None
+        if kind == 'independent_order':
+            for name in ('base_data_sha256', 'reference_sha256'):
+                if name in group and group[name].nunique(dropna=False) != 1:
+                    raise ValueError(f"Mixed {name} values in fixed-data order replicates.")
+        if kind in INDEPENDENT_REPLICATES:
+            if 'replicate_id' not in group or group['replicate_id'].isna().any():
+                raise ValueError('Independent replicates require explicit replicate_id values.')
+            if group.duplicated(['method', 'replicate_id']).any():
+                raise ValueError('Duplicate replicate_id rows would count timing reruns as independent observations.')
+            replicate_sets = [set(method['replicate_id']) for _, method in group.groupby('method')]
+            if any(ids != replicate_sets[0] for ids in replicate_sets[1:]):
+                raise ValueError('Methods must use the same independent replicate identities.')
+            comparable = [replicate for _, replicate in group.groupby('replicate_id')]
+        else:
+            comparable = [group]
+        for sample in comparable:
+            for name in DATA_IDENTITY_COLUMNS:
+                if name in sample and sample[name].nunique(dropna=False) != 1:
+                    raise ValueError(f"Mixed {name} values across compared measurements.")
+
+
 def standardize_input_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize to columns: dataset, method, run, time_ms, rmse
-    Accepts either:
-      - (dataset, algorithm, run_id, time_ms, rmse, ...)
-      - (dataset, method, run, time_ms, rmse)
+    """Normalize column names without discarding estimator/target identity.
+
+    Archival CSVs lacking provenance can be plotted, but are explicitly marked
+    as unidentified. Failed or nonfinite measurements require attention instead
+    of disappearing from the figures.
     """
     df = df.copy()
-
     if 'method' not in df.columns and 'algorithm' in df.columns:
         df = df.rename(columns={'algorithm': 'method'})
     if 'run' not in df.columns and 'run_id' in df.columns:
         df = df.rename(columns={'run_id': 'run'})
-
     required = {'dataset', 'method', 'run', 'time_ms', 'rmse'}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Input CSV missing required columns after standardization: {sorted(missing)}")
-
-    # Keep only relevant columns but tolerate extras
-    keep_cols = ['dataset', 'method', 'run', 'time_ms', 'rmse']
-    df = df[keep_cols].copy()
-
-    # Enforce types
-    df['dataset'] = df['dataset'].astype(str)
-    df['method'] = df['method'].astype(str)
-    df['run'] = pd.to_numeric(df['run'], errors='coerce').astype('Int64')
-    df['time_ms'] = pd.to_numeric(df['time_ms'], errors='coerce')
-    df['rmse'] = pd.to_numeric(df['rmse'], errors='coerce')
-
-    df = df.dropna(subset=['dataset', 'method', 'time_ms', 'rmse'])
+        raise ValueError(f"Input CSV missing required columns: {sorted(missing)}")
+    if df.empty or df[list(required)].isna().any().any():
+        raise ValueError("Input measurements must be nonempty and have no missing required values.")
+    if 'status' in df and not df['status'].eq('completed').all():
+        raise ValueError("Input includes failed or incomplete measurements; inspect them before plotting.")
+    if 'estimate_status' in df and not df['estimate_status'].eq('complete').all():
+        raise ValueError("Input includes incomplete pair coverage; inspect validity before plotting.")
+    if 'timing_status' in df and not df['timing_status'].eq('warmed').all():
+        raise ValueError("Input includes timings without a successful warm-up.")
+    if 'requested_runs' in df:
+        for _, group in df.groupby(['dataset', 'method'], dropna=False):
+            counts = pd.to_numeric(group['requested_runs'], errors='raise')
+            if counts.isna().any() or counts.nunique() != 1 or counts.iloc[0] != len(group):
+                raise ValueError("Input omits requested runs; success-conditioned figures need an explicit design.")
+    for name in ('run', 'time_ms', 'rmse'):
+        df[name] = pd.to_numeric(df[name], errors='raise')
+        if not np.isfinite(df[name]).all():
+            raise ValueError(f"Input column {name} must be finite.")
+    if (df['time_ms'] <= 0).any() or (df['rmse'] < 0).any():
+        raise ValueError("Execution times must be positive and RMSE nonnegative.")
+    for name in ('dataset', 'method'):
+        df[name] = df[name].astype(str)
+    for name in ('estimator_parameters', 'policy_parameters'):
+        if name in df:
+            def canonical(value):
+                if isinstance(value, str):
+                    value = json.loads(value)
+                return json.dumps(value, sort_keys=True, allow_nan=False)
+            df[name] = df[name].map(canonical)
+    missing_identity = [name for name in REQUIRED_IDENTITY
+                        if name not in df or df[name].isna().any()]
+    df['identity_status'] = 'provided' if not missing_identity else 'archival_partially_identified'
+    _validate_identity(df)
+    if missing_identity:
+        warnings.warn('CSV lacks complete comparison identity (' + ', '.join(missing_identity)
+                      + '); archival comparisons are not verified.', UserWarning)
     return df
 
 
 def compute_summary(df_std: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute summary per dataset-method with mean/std/count and 95% CI half-width.
-    """
-    g = df_std.groupby(['dataset', 'method'], as_index=False).agg(
-        time_mean=('time_ms', 'mean'),
-        time_std=('time_ms', 'std'),
-        n_runs=('time_ms', 'count'),
-        rmse_mean=('rmse', 'mean'),
-        rmse_std=('rmse', 'std'),
+    """Summarize repeated runs while retaining their verified identity."""
+    _validate_identity(df_std)
+    aggregation = dict(
+        time_mean=('time_ms', 'mean'), time_std=('time_ms', 'std'),
+        n_runs=('time_ms', 'count'), rmse_mean=('rmse', 'mean'), rmse_std=('rmse', 'std'),
     )
-
-    # Replace NaN std for n=1 with 0 to avoid CI NaNs
+    for name in IDENTITY_COLUMNS:
+        if name in df_std:
+            aggregation[name] = (name, 'first')
+    g = df_std.groupby(['dataset', 'method'], as_index=False).agg(**aggregation)
     g['time_std'] = g['time_std'].fillna(0.0)
     g['rmse_std'] = g['rmse_std'].fillna(0.0)
-
-    # 95% normal CI half-width (consistent with your original code)
-    g['time_ci'] = 1.96 * g['time_std'] / np.sqrt(np.maximum(g['n_runs'], 1))
-    g['rmse_ci'] = 1.96 * g['rmse_std'] / np.sqrt(np.maximum(g['n_runs'], 1))
+    # Timing repetition does not create independent statistical error samples.
+    g['time_ci'] = 1.96 * g['time_std'] / np.sqrt(g['n_runs'])
+    g['rmse_ci'] = np.nan
+    g['rmse_ci_basis'] = 'not_estimated'
+    if 'replicate_kind' in g:
+        independent = g['replicate_kind'].isin(INDEPENDENT_REPLICATES) & (g['n_runs'] > 1)
+        g.loc[independent, 'rmse_ci'] = 1.96 * g.loc[independent, 'rmse_std'] / np.sqrt(g.loc[independent, 'n_runs'])
+        g.loc[independent, 'rmse_ci_basis'] = 'normal95_' + g.loc[independent, 'replicate_kind']
     return g
 
 
@@ -187,9 +271,16 @@ def _dataset_label(dataset: str) -> str:
     return DATASET_NAMES.get(dataset, dataset)
 
 
-def _save_all_formats(fig, out_dir: Path, stem: str) -> None:
-    """Save figure as PNG only."""
+def _save_all_formats(fig, out_dir: Path, stem: str, summary: pd.DataFrame | None = None) -> None:
+    """Save an editable vector export and a PNG preview."""
+    if summary is not None and (
+        'identity_status' not in summary
+        or not summary['identity_status'].eq('provided').all()
+    ):
+        fig.text(0.5, -0.015, 'Archival input: incomplete data/reference identity; comparability is unverified.',
+                 ha='center', fontsize=8)
     fig.savefig(out_dir / f"{stem}.png", format='png', dpi=300)
+    fig.savefig(out_dir / f"{stem}.pdf", format='pdf')
 
 
 # -------------------------
@@ -215,8 +306,8 @@ def figure1_time_comparison(summary: pd.DataFrame, datasets: list[str], methods:
     for i, method in enumerate(methods):
         mdata = summary[summary['method'] == method].set_index('dataset')
 
-        times = [float(mdata.loc[d, 'time_mean']) if d in mdata.index else 0.0 for d in datasets]
-        errs = [float(mdata.loc[d, 'time_ci']) if d in mdata.index else 0.0 for d in datasets]
+        times = [float(mdata.loc[d, 'time_mean']) if d in mdata.index else np.nan for d in datasets]
+        errs = [float(mdata.loc[d, 'time_ci']) if d in mdata.index else np.nan for d in datasets]
 
         ax.bar(
             x + offsets[i],
@@ -266,7 +357,7 @@ def figure1_time_comparison(summary: pd.DataFrame, datasets: list[str], methods:
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.25)  # Make room for legend below
-    _save_all_formats(fig, output_path, 'time_comparison')
+    _save_all_formats(fig, output_path, 'time_comparison', summary)
     plt.close()
 
 
@@ -274,115 +365,42 @@ def figure1_time_comparison(summary: pd.DataFrame, datasets: list[str], methods:
 # Figure 2: Estimator landscape
 # -------------------------
 def figure2_estimator_landscape(summary: pd.DataFrame, methods: list[str], output_path: Path):
+    """Plot measured runtime/reference error without assigning breakdown points.
+
+    Datasets remain separate: their reference targets and sample dimensions
+    may differ. Each point is the supplied within-dataset repeated-run mean.
     """
-    Scatter plot showing methods positioned by speed (x-axis, log) and robustness (y-axis).
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    # Average time across datasets per method
-    avg_times = summary.groupby('method')['time_mean'].mean()
-
-    # Breakdown points (%): keep consistent with paper narrative
-    # TrimmedPearson baselines use the same acceptance/trimming concept; we display ~25%.
-    breakdown_points = {
-        'Pearson': 0,
-        'Spearman': 0,
-        'Winsorized': 10,
-        'FastMCD': 50,
-        'TrimmedPearsonExact(no TER)': 25,
-        'TrimmedPearsonExact(TER)': 25,
-        'FORCE': 25,
-    }
-
-    # Marker styles for each method - differentiate TrimmedPearson variants
-    marker_styles = {
-        'Pearson': 'o',
-        'Spearman': 'o',
-        'Winsorized': 'o',
-        'FastMCD': 'o',
-        'TrimmedPearsonExact(no TER)': '^',  # Triangle up
-        'TrimmedPearsonExact(TER)': 'v',      # Triangle down
-        'FORCE': 's',                          # Square
-    }
-
-    # Y-axis offset to prevent overlap for methods with same breakdown point
-    y_offsets = {
-        'Pearson': 0,
-        'Spearman': 0,
-        'Winsorized': 0,
-        'FastMCD': 0,
-        'TrimmedPearsonExact(no TER)': 1.5,   # Slightly above 25%
-        'TrimmedPearsonExact(TER)': -1.5,     # Slightly below 25%
-        'FORCE': 0,
-    }
-
-    # Store scatter handles for legend
-    scatter_handles = []
-    scatter_labels = []
-
-    for method in methods:
-        if method not in avg_times.index:
-            continue
-
-        x = float(avg_times[method])
-        y = float(breakdown_points.get(method, np.nan)) + y_offsets.get(method, 0)
-
-        marker_size = 320 if method == 'FORCE' else 220
-        marker = marker_styles.get(method, 'o')
-        edgecolor = 'black' if method == 'FORCE' else 'white'
-        linewidth = 2 if method == 'FORCE' else 1
-
-        scatter = ax.scatter(
-            x, y,
-            s=marker_size,
-            c=_method_color(method),
-            marker=marker,
-            edgecolors=edgecolor,
-            linewidths=linewidth,
-            zorder=5,
-            label=method
-        )
-        scatter_handles.append(scatter)
-        scatter_labels.append(method)
-
-    ax.set_xscale('log')
-    ax.set_xlabel('Average Execution Time (ms)', fontweight='bold', fontsize=11)
-    ax.set_ylabel('Breakdown Point (%)', fontweight='bold', fontsize=11)
-
-    # Limits - extend x-axis for FastMCD which can be very slow
-    x_max = max(50000, float(avg_times.max()) * 2 if len(avg_times) else 50000)
-    ax.set_xlim(0.05, x_max)
-    ax.set_ylim(-5, 60)
-
-    # Quadrant shading (adjusted for wider x range)
-    rect1 = plt.Rectangle((0.05, -5), 10 - 0.05, 15, facecolor='#ffcccc', alpha=0.3, zorder=1)
-    rect2 = plt.Rectangle((10, 15), x_max - 10, 60 - 15, facecolor='#ccccff', alpha=0.3, zorder=1)
-    rect3 = plt.Rectangle((0.05, 15), 10 - 0.05, 60 - 15, facecolor='#ccffcc', alpha=0.4, zorder=1)
-    ax.add_patch(rect1); ax.add_patch(rect2); ax.add_patch(rect3)
-
-    ax.text(0.15, 2, 'Fast-Fragile', fontsize=9, color='#cc0000', style='italic', alpha=0.8)
-    ax.text(500, 55, 'Slow-Robust', fontsize=9, color='#0000cc', style='italic', alpha=0.8)
-    ax.text(0.15, 55, 'Fast-Robust\n(target)', fontsize=9, color='#006600', fontweight='bold', alpha=0.9)
-
-    ax.axvline(x=10, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-    ax.axhline(y=15, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-
-    ax.grid(True, linestyle='-', alpha=0.3, zorder=0)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, p: f'{v:g}'))
-
-    # Legend below figure in two rows (no text annotations in plot)
-    ax.legend(
-        loc='upper center',
-        framealpha=0.95,
-        ncol=4,
-        bbox_to_anchor=(0.5, -0.12),
-        fontsize=9
-    )
-
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.2)  # Make room for legend below
-    _save_all_formats(fig, output_path, 'estimator_landscape')
-    plt.close()
+    datasets = list(summary['dataset'].unique())
+    ncols = min(2, len(datasets))
+    nrows = int(np.ceil(len(datasets) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.1, 2.7 * nrows + 0.8),
+                             squeeze=False, layout='constrained')
+    for ax, dataset in zip(axes.flat, datasets):
+        subset = summary[summary['dataset'] == dataset].set_index('method')
+        for index, method in enumerate(methods):
+            if method not in subset.index:
+                continue
+            row = subset.loc[method]
+            ax.scatter(float(row['time_mean']), float(row['rmse_mean']),
+                       label=method, color=_method_color(method),
+                       marker=['o', 's', '^', 'v', 'D', 'P', 'X'][index % 7], s=45)
+        ax.set_xscale('log')
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel('Mean execution time (ms)')
+        ax.set_ylabel('Mean RMSE vs supplied reference')
+        ax.set_title(_dataset_label(dataset))
+        ax.grid(alpha=0.2)
+    for ax in list(axes.flat)[len(datasets):]:
+        ax.set_visible(False)
+    handles = {}
+    for ax in axes.flat:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    fig.legend(handles.values(), handles.keys(), loc='outside lower center',
+               ncol=min(3, len(handles)), fontsize=8)
+    fig.suptitle('Measured runtime and reference error; no breakdown point inferred', fontsize=10)
+    _save_all_formats(fig, output_path, 'runtime_accuracy', summary)
+    plt.close(fig)
 
 
 # -------------------------
@@ -390,7 +408,7 @@ def figure2_estimator_landscape(summary: pd.DataFrame, methods: list[str], outpu
 # -------------------------
 def figure3_rmse_comparison(summary: pd.DataFrame, datasets: list[str], methods: list[str], output_path: Path):
     """
-    Grouped bar chart showing RMSE values with error bars (95% CI).
+    Reference errors; intervals require declared independent replicates.
     """
     fig, ax = plt.subplots(figsize=(10, 5))
 
@@ -404,8 +422,8 @@ def figure3_rmse_comparison(summary: pd.DataFrame, datasets: list[str], methods:
     for i, method in enumerate(methods):
         mdata = summary[summary['method'] == method].set_index('dataset')
 
-        vals = [float(mdata.loc[d, 'rmse_mean']) if d in mdata.index else 0.0 for d in datasets]
-        errs = [float(mdata.loc[d, 'rmse_ci']) if d in mdata.index else 0.0 for d in datasets]
+        vals = [float(mdata.loc[d, 'rmse_mean']) if d in mdata.index else np.nan for d in datasets]
+        errs = [float(mdata.loc[d, 'rmse_ci']) if d in mdata.index else np.nan for d in datasets]
 
         ax.bar(
             x + offsets[i],
@@ -413,7 +431,7 @@ def figure3_rmse_comparison(summary: pd.DataFrame, datasets: list[str], methods:
             width,
             label=method,
             color=_method_color(method),
-            yerr=errs,
+            yerr=errs if np.isfinite(errs).any() else None,
             capsize=2,
             error_kw={'linewidth': 0.8, 'capthick': 0.8},
             edgecolor='black',
@@ -421,7 +439,17 @@ def figure3_rmse_comparison(summary: pd.DataFrame, datasets: list[str], methods:
         )
 
     ax.set_xlabel('Dataset', fontweight='bold')
-    ax.set_ylabel('RMSE (Lower is Better)', fontweight='bold')
+    ax.set_ylabel('RMSE vs supplied reference', fontweight='bold')
+    if (summary['rmse_ci'].notna().any() and 'replicate_kind' in summary
+            and summary['replicate_kind'].eq('independent_order').all()):
+        note = '95% intervals for mean error over random orderings of each fixed dataset'
+    elif summary['rmse_ci'].notna().any():
+        note = 'Error bars: 95% normal intervals over declared independent data/order replicates'
+    elif 'replicate_kind' in summary and summary['replicate_kind'].eq('fixed_dataset_timing').all():
+        note = 'Conditional fixed-dataset error; timing reruns provide no RMSE confidence interval'
+    else:
+        note = 'Replicate design unspecified or insufficient; no RMSE confidence interval'
+    ax.set_title(note, fontsize=9)
     ax.set_xticks(x)
     ax.set_xticklabels([_dataset_label(d) for d in datasets])
 
@@ -446,7 +474,7 @@ def figure3_rmse_comparison(summary: pd.DataFrame, datasets: list[str], methods:
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.25)  # Make room for legend below
-    _save_all_formats(fig, output_path, 'rmse_comparison')
+    _save_all_formats(fig, output_path, 'rmse_comparison', summary)
     plt.close()
 
 
@@ -526,7 +554,7 @@ def figure4_speedup_heatmap(summary: pd.DataFrame, datasets: list[str], methods:
     ax.set_title('FORCE Speedup Over Other Methods', fontweight='bold', pad=10)
 
     plt.tight_layout()
-    fig.savefig(output_path / 'speedup_heatmap.png', format='png', dpi=300)
+    _save_all_formats(fig, output_path, 'speedup_heatmap', summary)
     plt.close()
 
 
@@ -550,7 +578,7 @@ def figure5_combined_performance(summary: pd.DataFrame, datasets: list[str], met
     # (a) Time
     for i, method in enumerate(methods):
         mdata = summary[summary['method'] == method].set_index('dataset')
-        times = [float(mdata.loc[d, 'time_mean']) if d in mdata.index else 0.0 for d in datasets]
+        times = [float(mdata.loc[d, 'time_mean']) if d in mdata.index else np.nan for d in datasets]
         ax1.bar(x + offsets[i], times, width, label=method, color=_method_color(method),
                 edgecolor='black', linewidth=0.5)
 
@@ -566,15 +594,15 @@ def figure5_combined_performance(summary: pd.DataFrame, datasets: list[str], met
     # (b) RMSE
     for i, method in enumerate(methods):
         mdata = summary[summary['method'] == method].set_index('dataset')
-        vals = [float(mdata.loc[d, 'rmse_mean']) if d in mdata.index else 0.0 for d in datasets]
+        vals = [float(mdata.loc[d, 'rmse_mean']) if d in mdata.index else np.nan for d in datasets]
         ax2.bar(x + offsets[i], vals, width, label=method, color=_method_color(method),
                 edgecolor='black', linewidth=0.5)
 
     ax2.set_xlabel('Dataset', fontweight='bold')
-    ax2.set_ylabel('RMSE', fontweight='bold')
+    ax2.set_ylabel('RMSE vs supplied reference', fontweight='bold')
     ax2.set_xticks(x)
     ax2.set_xticklabels([_dataset_label(d) for d in datasets], ha='center')
-    ax2.set_title('(b) Estimation Accuracy', fontweight='bold')
+    ax2.set_title('(b) Reference Error', fontweight='bold')
     ax2.yaxis.grid(True, linestyle='-', alpha=0.3)
     ax2.set_axisbelow(True)
 
@@ -585,7 +613,7 @@ def figure5_combined_performance(summary: pd.DataFrame, datasets: list[str], met
 
     plt.tight_layout()
     plt.subplots_adjust(bottom=0.15)  # Make room for legend below
-    fig.savefig(output_path / 'combined_performance.png', format='png', dpi=300)
+    _save_all_formats(fig, output_path, 'combined_performance', summary)
     plt.close()
 
 
@@ -618,15 +646,16 @@ def print_summary_statistics(summary: pd.DataFrame, datasets: list[str], methods
                 std = float(row['rmse_std'].values[0])
                 n = int(row['n_runs'].values[0])
                 ci = float(row['rmse_ci'].values[0])
-                print(f"  {m:26s}: {mean:8.5f} ± {std:8.5f} (n={n:2d}, CI±{ci:.5f})")
+                interval = f'CI±{ci:.5f}' if np.isfinite(ci) else 'RMSE CI not estimated'
+                print(f"  {m:26s}: {mean:8.5f} ± {std:8.5f} (n={n:2d}, {interval})")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_csv", type=str, required=True,
                     help="Path to results_raw_*.csv or benchmark_per_run.csv")
-    ap.add_argument("--output_dir", type=str, default="figures",
-                    help="Directory to save figures (pdf/png/eps)")
+    ap.add_argument("--output_dir", type=str, default="generated_figures/benchmarks",
+                    help="Directory for measured figure exports (PDF and PNG)")
     args = ap.parse_args()
 
     input_file = Path(args.input_csv)
@@ -655,7 +684,7 @@ def main():
     print(f"Saved: {output_path / 'time_comparison.*'}")
 
     figure2_estimator_landscape(summary, methods, output_path)
-    print(f"Saved: {output_path / 'estimator_landscape.*'}")
+    print(f"Saved: {output_path / 'runtime_accuracy.*'}")
 
     figure3_rmse_comparison(summary, datasets, methods, output_path)
     print(f"Saved: {output_path / 'rmse_comparison.*'}")
@@ -666,6 +695,16 @@ def main():
     figure5_combined_performance(summary, datasets, methods, output_path)
     print(f"Saved: {output_path / 'combined_performance.*'}")
 
+    identities = [name for name in IDENTITY_COLUMNS + DATA_IDENTITY_COLUMNS + ['replicate_id'] if name in df]
+    provenance = {
+        'source_csv': str(input_file.resolve()),
+        'source_sha256': hashlib.sha256(input_file.read_bytes()).hexdigest(),
+        'identities': df[['dataset', 'method'] + identities].drop_duplicates().to_dict(orient='records'),
+        'identity_status': df['identity_status'].iloc[0],
+        'interpretation': 'Measured runtime and supplied-reference error; no breakdown guarantee.',
+        'aggregation': 'Arithmetic means within dataset/method. Timing intervals describe supplied timing repetitions. RMSE intervals require explicitly declared independent_data/independent_order replicates with unique replicate_id values; fixed-dataset or unidentified repetitions have no RMSE interval. Order-only uncertainty is conditional on its fixed dataset.',
+    }
+    (output_path / 'figure_provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
     print("\nDone.")
 
 

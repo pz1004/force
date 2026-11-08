@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "source_path": "VERIFICATION.md",
+      "archive_path": "archive/development/VERIFICATION.md.txt",
+      "bytes": 60901,
+      "sha256": "7562b3d1c50a82a559e4a0a01d8bb5cef178f0ad938d332e3f6355847799c1f9"
+    },
+    {
+      "source_path": "ALGORITHM_REVISION_PLAN.md",
+      "archive_path": "archive/development/ALGORITHM_REVISION_PLAN.md.txt",
+      "bytes": 23880,
+      "sha256": "28c30cd3663d1297be42e80fd6307b0fcb050503534fbb160edeb9404c973fb2"
+    },
+    {
+      "source_path": "REVIEW_REVISION_PLAN.md",
+      "archive_path": "archive/development/REVIEW_REVISION_PLAN.md.txt",
+      "bytes": 19986,
+      "sha256": "05f4d1fc866cceebc3196f570ae97121b56967c9e350b614a1687a9542e456ce"
+    }
+  ]
+}

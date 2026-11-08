@@ -66,12 +66,15 @@ def estimator_parameters(estimator: Any) -> dict[str, Any]:
     names = (
         "lambda_scale",
         "exact_cutover",
+        "exact_prefix",
+        "window_size",
         "use_ter",
         "ter_max",
         "epsilon",
         "lam",
         "eps",
         "limits",
+        "quantile_method",
         "random_state",
         "support_fraction",
     )

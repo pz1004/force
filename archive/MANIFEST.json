@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "archived_on": "2026-11-08",
+  "source_repository": "https://github.com/pz1004/force",
+  "source_base_commit": "ccae8be07aa4eb9d044f0d01fa1d23ddb7c8007c",
+  "provenance_scope": "Exact bytes present in the working tree before archival relocation. The base commit identifies prior local history; it does not establish the original data, command, environment, or generation time of an artifact.",
+  "files": [
+    {
+      "original_path": "figures/breakdown_validation.png",
+      "archive_path": "archive/paper-figures/breakdown_validation.png",
+      "bytes": 350594,
+      "sha256": "6939cc686b0e9e66facaaf735fe835ce26878654f2ca82a780f36fd9e2941930",
+      "base_commit_sha256": "6939cc686b0e9e66facaaf735fe835ce26878654f2ca82a780f36fd9e2941930",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "figures/combined_performance.png",
+      "archive_path": "archive/paper-figures/combined_performance.png",
+      "bytes": 167462,
+      "sha256": "845f909b6e45f3c4cc49c765d0bbd7dfdd3d30bc8973b3ba836d1fe716de24ec",
+      "base_commit_sha256": "845f909b6e45f3c4cc49c765d0bbd7dfdd3d30bc8973b3ba836d1fe716de24ec",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "figures/estimator_landscape.png",
+      "archive_path": "archive/paper-figures/estimator_landscape.png",
+      "bytes": 165128,
+      "sha256": "de4e6581cd4f5780709a0f742345cce79fc2adffa564c1dfa244a75e5693aa7a",
+      "base_commit_sha256": "de4e6581cd4f5780709a0f742345cce79fc2adffa564c1dfa244a75e5693aa7a",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "figures/rmse_comparison.png",
+      "archive_path": "archive/paper-figures/rmse_comparison.png",
+      "bytes": 117475,
+      "sha256": "4ed6517446713c623662a0e3a7e7e44c170124160cd55a4814a5bdae99516dd3",
+      "base_commit_sha256": "4ed6517446713c623662a0e3a7e7e44c170124160cd55a4814a5bdae99516dd3",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "figures/speedup_heatmap.png",
+      "archive_path": "archive/paper-figures/speedup_heatmap.png",
+      "bytes": 288124,
+      "sha256": "de920ce2bcac9ce56d403e17db545fa2241fe23355036ebef57faa266cbd2b81",
+      "base_commit_sha256": "de920ce2bcac9ce56d403e17db545fa2241fe23355036ebef57faa266cbd2b81",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "figures/time_comparison.png",
+      "archive_path": "archive/paper-figures/time_comparison.png",
+      "bytes": 125584,
+      "sha256": "761b096287c84d183f528521dbd1ed97b2e9ddf397b7f8906ec142a79ad49d5a",
+      "base_commit_sha256": "761b096287c84d183f528521dbd1ed97b2e9ddf397b7f8906ec142a79ad49d5a",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "results/sp500_volatility_sensitivity_20251225_234711.csv",
+      "archive_path": "archive/results/sp500_volatility_sensitivity_20251225_234711.csv",
+      "bytes": 513,
+      "sha256": "2ffc3afaece58cd374f1adddfb145fef1428972cf1d8763ce99b651a0a6fff41",
+      "base_commit_sha256": "2ffc3afaece58cd374f1adddfb145fef1428972cf1d8763ce99b651a0a6fff41",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "results/sp500_volatility_sensitivity_summary_20251225_234711.csv",
+      "archive_path": "archive/results/sp500_volatility_sensitivity_summary_20251225_234711.csv",
+      "bytes": 158,
+      "sha256": "4ae9ef43886f05c151b31531d5ae3f9bf9cda97bc4e9e4f16ae897272649cb81",
+      "base_commit_sha256": "4ae9ef43886f05c151b31531d5ae3f9bf9cda97bc4e9e4f16ae897272649cb81",
+      "matches_base_commit": true
+    },
+    {
+      "original_path": "scripts/update_latex_tables.py",
+      "archive_path": "archive/tools/update_latex_tables.py.txt",
+      "bytes": 25424,
+      "sha256": "b2e01b1a1ef541eb6d62108adbf0400a0d17c7b20028a206e26eecc9e4c3d490",
+      "base_commit_sha256": "6c6ba79b7a05a51960e08fdc72551c46038f98b889514d4e87d873bec1255131",
+      "matches_base_commit": false
+    }
+  ]
+}

@@ -23,6 +23,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from force import ForceEstimator, LegacyForceEstimator
+from force._evaluation import correlation_score, estimator_pair_validity
 from force.protocols import get_protocol
 from force.reporting import (
     command_line,
@@ -42,11 +43,19 @@ def _estimator(protocol: str, *, use_ter: bool):
     )
 
 
-def _mse(
-    X: np.ndarray, rho: float, *, use_ter: bool, protocol: str
-) -> float:
-    estimate = _estimator(protocol, use_ter=use_ter).fit(X)
-    return float((estimate[0, 1] - rho) ** 2)
+def _mse(X: np.ndarray, rho: float, *, use_ter: bool, protocol: str) -> float | None:
+    estimator = _estimator(protocol, use_ter=use_ter)
+    estimate = estimator.fit(X)
+    valid, _ = estimator_pair_validity(estimator, estimate)
+    reference = np.array([[1.0, rho], [rho, 1.0]])
+    score = correlation_score(
+        estimate, reference, estimate_valid=valid, require_complete=True
+    )
+    return None if score["rmse"] is None else float(score["rmse"] ** 2)
+
+
+def _complete_mean(values):
+    return None if any(value is None for value in values) else float(np.mean(values))
 
 
 def run_analysis(
@@ -58,8 +67,8 @@ def run_analysis(
     rows: List[Dict[str, object]] = []
 
     for contamination in (0.0, 0.05, 0.10, 0.15):
-        with_ter: List[float] = []
-        fixed: List[float] = []
+        with_ter: List[float | None] = []
+        fixed: List[float | None] = []
         for _ in range(repetitions):
             n_outliers = int(contamination * n_samples)
             clean = rng.multivariate_normal(
@@ -72,12 +81,8 @@ def run_analysis(
             )
             X = np.vstack((clean, outliers))
             rng.shuffle(X)
-            with_ter.append(
-                _mse(X, rho, use_ter=True, protocol=protocol)
-            )
-            fixed.append(
-                _mse(X, rho, use_ter=False, protocol=protocol)
-            )
+            with_ter.append(_mse(X, rho, use_ter=True, protocol=protocol))
+            fixed.append(_mse(X, rho, use_ter=False, protocol=protocol))
         rows.append(
             {
                 "scenario": "asymmetric_contamination",
@@ -85,8 +90,11 @@ def run_analysis(
                 "status": "completed",
                 "seed": seed,
                 "parameter": contamination,
-                "mse_ter": float(np.mean(with_ter)),
-                "mse_fixed": float(np.mean(fixed)),
+                "mse_ter": _complete_mean(with_ter),
+                "mse_fixed": _complete_mean(fixed),
+                "usable_ter_repetitions": sum(value is not None for value in with_ter),
+                "usable_fixed_repetitions": sum(value is not None for value in fixed),
+                "metric_policy": "all_requested_repetitions_must_be_defined",
                 "repetitions": repetitions,
             }
         )
@@ -95,17 +103,11 @@ def run_analysis(
         with_ter = []
         fixed = []
         for _ in range(repetitions):
-            normal = rng.multivariate_normal(
-                np.zeros(2), covariance, n_samples
-            )
+            normal = rng.multivariate_normal(np.zeros(2), covariance, n_samples)
             scale = rng.chisquare(degrees, n_samples) / degrees
             X = normal / np.sqrt(scale)[:, None]
-            with_ter.append(
-                _mse(X, rho, use_ter=True, protocol=protocol)
-            )
-            fixed.append(
-                _mse(X, rho, use_ter=False, protocol=protocol)
-            )
+            with_ter.append(_mse(X, rho, use_ter=True, protocol=protocol))
+            fixed.append(_mse(X, rho, use_ter=False, protocol=protocol))
         rows.append(
             {
                 "scenario": "coherent_student_t",
@@ -113,8 +115,11 @@ def run_analysis(
                 "status": "completed",
                 "seed": seed,
                 "parameter": f"df={degrees}",
-                "mse_ter": float(np.mean(with_ter)),
-                "mse_fixed": float(np.mean(fixed)),
+                "mse_ter": _complete_mean(with_ter),
+                "mse_fixed": _complete_mean(fixed),
+                "usable_ter_repetitions": sum(value is not None for value in with_ter),
+                "usable_fixed_repetitions": sum(value is not None for value in fixed),
+                "metric_policy": "all_requested_repetitions_must_be_defined",
                 "repetitions": repetitions,
             }
         )
@@ -136,13 +141,9 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--data-dir", default=None)
-    parser.add_argument(
-        "--output-dir", default="./verification_results/ter_analysis"
-    )
+    parser.add_argument("--output-dir", default="./verification_results/ter_analysis")
     args = parser.parse_args()
-    requested_runs = (
-        args.repetitions if args.repetitions is not None else args.runs
-    )
+    requested_runs = args.repetitions if args.repetitions is not None else args.runs
     if requested_runs < 1:
         parser.error("--runs must be at least 1")
     if args.n_samples < 5:
@@ -167,9 +168,7 @@ def main() -> int:
             "schema_version": 1,
             "status": "completed",
             "protocol": get_protocol(args.protocol).as_dict(),
-            "implementation": type(
-                _estimator(args.protocol, use_ter=True)
-            ).__name__,
+            "implementation": type(_estimator(args.protocol, use_ter=True)).__name__,
             "smoke": bool(args.smoke),
             "offline": bool(args.offline),
             "data_dir": args.data_dir,
@@ -177,12 +176,8 @@ def main() -> int:
             "n_samples": n_samples,
             "runs": repetitions,
             "estimator_parameters": {
-                "ter": estimator_parameters(
-                    _estimator(args.protocol, use_ter=True)
-                ),
-                "fixed": estimator_parameters(
-                    _estimator(args.protocol, use_ter=False)
-                ),
+                "ter": estimator_parameters(_estimator(args.protocol, use_ter=True)),
+                "fixed": estimator_parameters(_estimator(args.protocol, use_ter=False)),
             },
             "environment": environment_metadata(),
             "command_line": command_line(),

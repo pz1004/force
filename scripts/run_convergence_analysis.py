@@ -24,6 +24,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from force.data import generate_synthetic_data_fixed_corr
+from force.diagnostics import diagnose_batch
+from force._evaluation import correlation_score, estimator_pair_validity
 from force.protocols import build_estimator, get_protocol
 from force.reporting import (
     command_line,
@@ -31,11 +33,6 @@ from force.reporting import (
     estimator_parameters,
     write_json,
 )
-
-
-def _rmse(left: np.ndarray, right: np.ndarray) -> float:
-    mask = np.triu(np.ones_like(left, dtype=bool), k=1)
-    return float(np.sqrt(np.mean((left[mask] - right[mask]) ** 2)))
 
 
 def run_convergence(
@@ -46,13 +43,11 @@ def run_convergence(
     contamination: float,
     seed: int,
     protocol: str,
-) -> List[Dict[str, float | int]]:
+) -> List[dict]:
     config = get_protocol(protocol)
-    distribution = str(
-        config.synthetic_parameters["contamination_distribution"]
-    )
+    distribution = str(config.synthetic_parameters["contamination_distribution"])
     outlier_scale = float(config.synthetic_parameters["outlier_scale"])
-    rows: List[Dict[str, float | int]] = []
+    rows: List[dict] = []
     warmup = np.random.default_rng(seed).normal(size=(100, 2))
     build_estimator(protocol, "FORCE").fit(warmup)
     build_estimator(protocol, "TP-TER").fit(warmup)
@@ -76,20 +71,63 @@ def run_convergence(
             start = perf_counter_ns()
             exact_correlation = exact.fit(X)
             exact_ms = (perf_counter_ns() - start) / 1_000_000.0
+            force_valid, force_validity_basis = estimator_pair_validity(
+                force, force_correlation
+            )
+            exact_valid, _ = estimator_pair_validity(exact, exact_correlation)
+            approximation_score = correlation_score(
+                force_correlation,
+                exact_correlation,
+                estimate_valid=force_valid,
+                reference_valid=exact_valid,
+            )
+            force_score = correlation_score(
+                force_correlation,
+                truth,
+                estimate_valid=force_valid,
+                require_complete=True,
+            )
+            exact_score = correlation_score(
+                exact_correlation,
+                truth,
+                estimate_valid=exact_valid,
+                require_complete=True,
+            )
+            # Run the independent oracle outside the timed region. Legacy
+            # FORCE and TP-TER differ in more than their quantile backend.
+            diagnostics = (
+                diagnose_batch(X, clean_reference=truth)
+                if protocol == "paper"
+                else None
+            )
             rows.append(
                 {
                     "protocol": protocol,
+                    "comparison_kind": (
+                        "matched_quantile_approximation"
+                        if protocol == "paper"
+                        else "different_estimator_functionals"
+                    ),
+                    "comparison_target": (
+                        "same_sample_exact_quantile_trimmed_Pearson"
+                        if protocol == "paper"
+                        else "paper_style_capped_TP_TER_vs_historical_FORCE"
+                    ),
+                    "clean_reference_target": "known_clean_population_Pearson",
                     "status": "completed",
                     "n_samples": n_samples,
                     "run_id": run_id + 1,
                     "seed": run_seed,
-                    "rmse_force_vs_exact": _rmse(
-                        force_correlation, exact_correlation
-                    ),
-                    "rmse_force_vs_true": _rmse(force_correlation, truth),
-                    "rmse_exact_vs_true": _rmse(exact_correlation, truth),
+                    "rmse_force_vs_exact": approximation_score["rmse"],
+                    "rmse_force_vs_true": force_score["rmse"],
+                    "rmse_exact_vs_true": exact_score["rmse"],
+                    "approximation_score": approximation_score,
+                    "force_clean_target_score": force_score,
+                    "exact_clean_target_score": exact_score,
+                    "force_validity_basis": force_validity_basis,
                     "force_time_ms": force_ms,
                     "exact_time_ms": exact_ms,
+                    "algorithm_diagnostics": diagnostics,
                 }
             )
     return rows
@@ -105,9 +143,7 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--data-dir", default=None)
-    parser.add_argument(
-        "--output-dir", default="./verification_results/convergence"
-    )
+    parser.add_argument("--output-dir", default="./verification_results/convergence")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be at least 1")
@@ -140,10 +176,13 @@ def main() -> int:
             "seed": args.seed,
             "sample_sizes": sizes,
             "runs": runs,
-            "n_features": min(args.n_features, 5)
-            if args.smoke
-            else args.n_features,
+            "n_features": min(args.n_features, 5) if args.smoke else args.n_features,
             "contamination": args.contamination,
+            "interpretation": (
+                "Quantile approximation and clean-target error are separate quantities."
+                if args.protocol == "paper"
+                else "Historical FORCE and TP-TER have different tails, bound policies, caps, and centering; their discrepancy is not isolated P2 quantile error."
+            ),
             "estimator_parameters": {
                 name: estimator_parameters(build_estimator(args.protocol, name))
                 for name in ("FORCE", "TP-TER")
