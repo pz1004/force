@@ -122,7 +122,21 @@ benchmark_results/
 benchmark_results_new/
 benchmark_results_old/
 convergence_results/
-verification_results/
-generated_figures/
 .force-data/
 force.log
+
+# Local research material, datasets, and generated output
+/manuscript/
+/paper/
+/supplement/
+/literature/
+/archive/
+/data/
+/results/
+/figures/
+/output/
+/generated_figures/
+/generated-paper-assets/
+/verification_results/
+/*-improvement-plan.md
+/mathematics-14-00191.pdf

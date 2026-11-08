@@ -13,13 +13,11 @@ Approximation for High-Dimensional Data Streams”](https://doi.org/10.3390/math
 
 See the [algorithm and validation guide](VERIFICATION.md) for the estimator
 contract, numerical conventions, benchmark interpretation, and verification
-commands. [Reference materials](archive/README.md) and the
-[research plan](force-improvement-plan.md) provide supporting records and
-remaining limitations.
+commands and remaining limitations.
 
 ## Main Results
 
-Section 3, Tables 4–6 of the [paper](mathematics-14-00191.pdf#page=19)
+Section 3, Tables 4–6 of the [paper](https://doi.org/10.3390/math14010191)
 compare FORCE with six baselines on five datasets. The reported execution-time
 speedup averages **470.53× over FastMCD** and **3.86× over Spearman**, with
 dataset-dependent accuracy. The table below collects the reported mean FORCE
@@ -107,6 +105,7 @@ initial streaming calibration window, which every fresh instance still consumes.
 
 ### Batch
 
+<!-- executable-example: batch -->
 ```python
 import numpy as np
 from force import ForceEstimator
@@ -129,6 +128,7 @@ same two-pass estimator; see the [algorithm contract](VERIFICATION.md#algorithm-
 
 ### Streaming
 
+<!-- executable-example: streaming -->
 ```python
 import numpy as np
 from force import StreamingForceEstimator
@@ -190,9 +190,9 @@ including the limits of the default uncapped tail expansion ratio.
 
 ## License
 
-The software is distributed under the [MIT License](LICENSE). The included
-[paper PDF](mathematics-14-00191.pdf) retains its authors' copyright and the
-Creative Commons Attribution (CC BY) license stated in the PDF.
+The software is distributed under the [MIT License](LICENSE). The separately published
+[paper](https://doi.org/10.3390/math14010191) retains its authors' copyright and the
+Creative Commons Attribution (CC BY) license stated in the publication.
 
 ## Citation
 

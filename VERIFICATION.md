@@ -1,6 +1,6 @@
 # FORCE algorithm and verification
 
-This document specifies the implementation of [FORCE](mathematics-14-00191.pdf),
+This document specifies the implementation of [FORCE](https://doi.org/10.3390/math14010191),
 *Mathematics* 2026, 14(1), 191,
 [doi:10.3390/math14010191](https://doi.org/10.3390/math14010191), and describes
 its validation. The paper PDF SHA-256 is:
@@ -136,9 +136,6 @@ from the paper. Adjacent block contributions share calibration/evaluation
 observations, so ordinary iid correlation uncertainty formulas do not apply.
 Drift and serial dependence require their own assumptions.
 
-The [paper improvement plan](force-improvement-plan.md) sets out corresponding
-specification clarifications, proof obligations and prospective extensions.
-
 ## Evaluation contract
 
 Algorithmic validation compares quantiles, bounds, acceptance masks, accepted
@@ -198,10 +195,37 @@ Build into an empty distribution directory for packaging validation:
 ```bash
 python -m pip install build
 python -m build --outdir dist
+python tools/verify_exclusion_build.py --dist-dir dist
 python tools/verify_distribution.py --dist-dir dist
 ```
 
 The checker installs dependencies from the configured package index. It checks
 the installed wheel and executes the source archive's full suite. The software
-uses the MIT license; the paper retains its own CC BY notice. Reference
-materials and supporting records are indexed in [archive/](archive/README.md).
+uses the MIT license; the separately published paper retains its own CC BY notice.
+Manuscripts, reference PDFs, historical archives, datasets, plans, and generated
+outputs are local research material excluded from Git and built distributions.
+The checker rejects these files in both wheels and source archives.
+
+The [exclusion build regression](tools/verify_exclusion_build.py) extracts the
+built source archive into a temporary tree and creates synthetic research files.
+It checks the shipped `.gitignore` in a temporary Git repository, then prepends
+fixture inclusion directives to `MANIFEST.in` so the original exclusions must
+remove files already selected for inclusion. It builds both a source archive and
+a wheel directly from that tree, checks their inventories independently, and
+requires retained software and configuration files. Real local research material
+is never copied or changed. Run this command with the build tooling used above;
+ordinary unit tests do not require build tools or package downloads. CI runs the
+regression after its Python 3.13 build.
+
+Wheel inventory checks cover the archive root and the relocated installation
+paths under `<distribution>.data/{data,purelib,platlib,scripts,headers}/`.
+Repository disclosure checks continue to use repository-relative paths.
+
+Runnable README examples use `<!-- executable-example: batch -->` and
+`<!-- executable-example: streaming -->` immediately before their Python opening fences (`` ```python ``).
+Both identifiers are required;
+additional unique identifiers are allowed, using a lowercase letter followed by
+lowercase letters, digits, underscores, or hyphens. The distribution checker
+executes every marked example in a separate isolated interpreter against the
+installed wheel. Unmarked snippets are ignored; duplicate identifiers, malformed
+markers, and empty or unclosed marked fences fail verification.

@@ -52,6 +52,9 @@ jobs:
         run: |
           python -m pip install build
           python -m build
+      - name: Verify research exclusions with fixture builds
+        if: matrix.python-version == '3.13'
+        run: python tools/verify_exclusion_build.py --dist-dir dist
       - name: Verify installed wheel and source distribution
         if: matrix.python-version == '3.13'
         run: python tools/verify_distribution.py --dist-dir dist

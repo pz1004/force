@@ -1,12 +1,25 @@
 include LICENSE README.md CITATION.cff VERIFICATION.md
 include .gitignore
-include force-improvement-plan.md
-include mathematics-14-00191.pdf
 include generate_figures.py generate_breakdown_figure.py
 recursive-include .github/workflows *.yml
 recursive-include examples *.py
 recursive-include scripts *.py
 recursive-include tools *.py
 recursive-include tests *.py
-recursive-include archive *.md *.json *.png *.csv *.py *.txt
 global-exclude __pycache__ *.py[cod]
+
+# Also exclude local copies when building outside Git or with stale egg-info.
+prune manuscript
+prune paper
+prune supplement
+prune literature
+prune archive
+prune data
+prune results
+prune figures
+prune output
+prune generated_figures
+prune generated-paper-assets
+prune verification_results
+exclude *-improvement-plan.md
+exclude mathematics-14-00191.pdf
